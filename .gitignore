@@ -1,0 +1,26 @@
+.env
+# Repo-root runtime output dirs (user data, never committed). The leading
+# slash matters: a bare "projects/" would also ignore the Next.js route tree
+# at apps/web/app/projects/.
+/projects/
+/library/
+infra/backups/
+infra/seeds/local/
+*.safetensors
+*.pt
+__pycache__/
+*.pyc
+node_modules/
+.next/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Next.js / TS build artifacts
+apps/web/tsconfig.tsbuildinfo
+
+# Local verification scratch (screenshots, verify DBs, E2E outputs)
+.tmp/
+.venv-test/

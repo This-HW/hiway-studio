@@ -1,0 +1,1 @@
+{"models":[{"capabilities":{},"constraints":{"aspect_ratios":["16:9","9:16","1:1"],"max_prompt_chars":2000},"fallback_model_ids":[],"modality":"text","model_id":"stub.text","params_schema":{},"pricing":{"amount_usd":"0.00","unit":"per_1k_tokens"},"provider_id":"stub","quality_rank":1,"status":"active"}]}

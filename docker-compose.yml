@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+
+  api:
+    build:
+      context: ./services/api
+    command: uvicorn app.main:app --host 0.0.0.0 --port ${API_PORT:-8000}
+    env_file: .env
+    environment:
+      # 컨테이너 내부 산출물 경로. compose가 ./projects를 여기에 마운트한다.
+      PROJECTS_ROOT: /data/ai-studio
+    volumes:
+      - ./projects:/data/ai-studio
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+
+  worker:
+    build:
+      context: ./services/api
+    command: celery -A app.tasks.celery_app worker -Q q.image,q.video,q.audio,q.post --loglevel=info
+    env_file: .env
+    environment:
+      PROJECTS_ROOT: /data/ai-studio
+    volumes:
+      - ./projects:/data/ai-studio
+      # Codex CLI subscription auth for the `cli` provider adapter.
+      # Run `codex login` on the host first; the worker (root in container)
+      # reads the same credentials from /root/.codex.
+      - ${HOME}/.codex:/root/.codex
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

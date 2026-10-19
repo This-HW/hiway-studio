@@ -1,0 +1,233 @@
+{
+  "_note": "Shared enumerations. Source of truth is packages/contracts/; backend and web mirror these values.",
+  "aspect_ratio": [
+    "16:9",
+    "9:16",
+    "1:1",
+    "2.39:1",
+    "4:5"
+  ],
+  "generation_status": [
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "canceled"
+  ],
+  "job_type": [
+    "text_to_image",
+    "image_to_image",
+    "inpaint",
+    "outpaint",
+    "upscale",
+    "text_to_video",
+    "image_to_video",
+    "video_extend",
+    "tts",
+    "lora_train",
+    "multishot",
+    "thumbnail",
+    "style_extract"
+  ],
+  "modality": [
+    "image",
+    "video",
+    "text",
+    "tts",
+    "audio_music",
+    "audio_sfx"
+  ],
+  "model_status": [
+    "active",
+    "disabled",
+    "deprecated"
+  ],
+  "qc_overall": [
+    "pass",
+    "warn",
+    "fail"
+  ],
+  "character_role": [
+    "protagonist",
+    "antagonist",
+    "supporting",
+    "extra"
+  ],
+  "consistency_method": [
+    "reference_image",
+    "lora",
+    "embedding",
+    "faceid",
+    "pulid",
+    "seed_locked",
+    "hybrid"
+  ],
+  "reference_role": [
+    "master",
+    "turnaround_front",
+    "turnaround_three_quarter",
+    "turnaround_profile",
+    "turnaround_back",
+    "expression_neutral",
+    "expression_happy",
+    "expression_sad",
+    "expression_angry",
+    "expression_surprised",
+    "expression_determined",
+    "expression_vulnerable",
+    "outfit_default",
+    "outfit_alt",
+    "pose_action",
+    "detail_face",
+    "detail_hands",
+    "detail_prop"
+  ],
+  "reference_source": [
+    "generated",
+    "uploaded",
+    "sheet_derived"
+  ],
+  "asset_kind": [
+    "location",
+    "prop",
+    "background",
+    "reference",
+    "audio"
+  ],
+  "episode_status": [
+    "draft",
+    "in_progress",
+    "done"
+  ],
+  "llm_purpose": [
+    "synopsis",
+    "beats",
+    "broll_suggest",
+    "translation",
+    "dialogue_polish",
+    "other"
+  ],
+  "shot_type": [
+    "establishing",
+    "wide",
+    "medium",
+    "close_up",
+    "extreme_close_up",
+    "over_the_shoulder",
+    "pov",
+    "insert",
+    "reaction",
+    "aerial",
+    "dutch"
+  ],
+  "camera_angle": [
+    "eye_level",
+    "high",
+    "low",
+    "birds_eye",
+    "worms_eye",
+    "dutch",
+    "ots"
+  ],
+  "camera_movement": [
+    "static",
+    "pan",
+    "tilt",
+    "dolly_in",
+    "dolly_out",
+    "truck",
+    "crane",
+    "orbit",
+    "orbit_360",
+    "zoom_in",
+    "zoom_out",
+    "crash_zoom_in",
+    "crash_zoom_out",
+    "dolly_zoom_in",
+    "dolly_zoom_out",
+    "whip_pan",
+    "jib_up",
+    "jib_down",
+    "snorricam",
+    "hyperlapse",
+    "handheld",
+    "fpv"
+  ],
+  "shot_status": [
+    "draft",
+    "frame_generating",
+    "frame_done",
+    "frame_approved",
+    "video_generating",
+    "video_done",
+    "failed"
+  ],
+  "shot_reference_purpose": [
+    "primary",
+    "expression",
+    "outfit",
+    "location",
+    "continuity"
+  ],
+  "job_status": [
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "canceled"
+  ],
+  "script_format": [
+    "txt",
+    "fountain",
+    "fdx"
+  ],
+  "video_mode": [
+    "i2v",
+    "t2v"
+  ],
+  "video_status": [
+    "draft",
+    "generating",
+    "done",
+    "failed"
+  ],
+  "render_status": [
+    "draft",
+    "rendering",
+    "done",
+    "failed"
+  ],
+  "subtitle_mode": [
+    "none",
+    "single",
+    "dual"
+  ],
+  "subtitle_position": [
+    "top",
+    "middle",
+    "bottom"
+  ],
+  "audio_kind": [
+    "dialogue",
+    "narration",
+    "bgm",
+    "sfx"
+  ],
+  "qc_target": [
+    "video",
+    "timeline"
+  ],
+  "qc_result": [
+    "pass",
+    "warn",
+    "fail"
+  ],
+  "bible_category": [
+    "character",
+    "faction",
+    "location",
+    "rule",
+    "event",
+    "item"
+  ]
+}

@@ -1,0 +1,116 @@
+{
+  "models": [
+    {
+      "capabilities": {
+        "tasks": [
+          "text_to_video"
+        ]
+      },
+      "constraints": {
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1"
+        ],
+        "max_duration_sec": 10,
+        "max_prompt_chars": 2000
+      },
+      "fallback_model_ids": [
+        "stub.t2v-quality"
+      ],
+      "modality": "video",
+      "model_id": "stub.t2v-fast",
+      "params_schema": {},
+      "pricing": {
+        "amount_usd": "0.00",
+        "unit": "per_second"
+      },
+      "provider_id": "stub",
+      "quality_rank": 1,
+      "status": "active"
+    },
+    {
+      "capabilities": {
+        "tasks": [
+          "text_to_video"
+        ]
+      },
+      "constraints": {
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1"
+        ],
+        "max_duration_sec": 10,
+        "max_prompt_chars": 2000
+      },
+      "fallback_model_ids": [],
+      "modality": "video",
+      "model_id": "stub.t2v-quality",
+      "params_schema": {},
+      "pricing": {
+        "amount_usd": "0.00",
+        "unit": "per_second"
+      },
+      "provider_id": "stub",
+      "quality_rank": 5,
+      "status": "active"
+    },
+    {
+      "capabilities": {
+        "tasks": [
+          "image_to_video"
+        ]
+      },
+      "constraints": {
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1"
+        ],
+        "max_duration_sec": 10,
+        "max_prompt_chars": 2000
+      },
+      "fallback_model_ids": [
+        "stub.i2v-quality"
+      ],
+      "modality": "video",
+      "model_id": "stub.i2v-fast",
+      "params_schema": {},
+      "pricing": {
+        "amount_usd": "0.00",
+        "unit": "per_second"
+      },
+      "provider_id": "stub",
+      "quality_rank": 1,
+      "status": "active"
+    },
+    {
+      "capabilities": {
+        "tasks": [
+          "image_to_video"
+        ]
+      },
+      "constraints": {
+        "aspect_ratios": [
+          "16:9",
+          "9:16",
+          "1:1"
+        ],
+        "max_duration_sec": 10,
+        "max_prompt_chars": 2000
+      },
+      "fallback_model_ids": [],
+      "modality": "video",
+      "model_id": "stub.i2v-quality",
+      "params_schema": {},
+      "pricing": {
+        "amount_usd": "0.00",
+        "unit": "per_second"
+      },
+      "provider_id": "stub",
+      "quality_rank": 5,
+      "status": "active"
+    }
+  ]
+}

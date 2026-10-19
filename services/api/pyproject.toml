@@ -1,0 +1,36 @@
+[project]
+name = "ai-studio-api"
+version = "0.1.0"
+description = "AI Studio backend: FastAPI + Celery sharing one Python package"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "celery[redis]>=5.3",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27",
+    "pillow>=10.0",
+    "python-multipart>=0.0.9",
+    "rapidocr-onnxruntime>=1.4",  # QC OCR (PaddleOCR PP-OCR models, ONNX Runtime)
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
