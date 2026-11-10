@@ -141,6 +141,11 @@ HTTP_POLL_TIMEOUT_SEC: float = 15.0
 HTTP_DOWNLOAD_TIMEOUT_SEC: float = 120.0
 HTTP_UPLOAD_TIMEOUT_SEC: float = 60.0
 HTTP_CANCEL_TIMEOUT_SEC: float = 10.0
+# Process-wide cap of DNS resolver threads (getaddrinfo has no timeout and
+# runs on a daemon thread). A resolver hanging past its call's deadline
+# keeps its slot until it returns; a call waiting for a slot past its
+# deadline fails with the deadline error (ADR-0014 B9a-r2 M2). [proposed]
+HTTP_DNS_MAX_RESOLVER_THREADS: int = 8
 # Provider response text quoted in error messages/logs (after secret redaction).
 HTTP_ERROR_SNIPPET_CHARS: int = 300
 # Still-image generation without an explicit seed draws one from [0, 2**31)

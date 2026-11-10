@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -97,6 +98,99 @@ def get_model(model_id: str, db=None) -> dict[str, Any]:
         return cache[model_id]
     except KeyError:
         raise StudioError(ErrorCode.NOT_FOUND, f"Model not found in registry: {model_id}.")
+
+
+# Largest value Postgres accepts for statement_timeout / lock_timeout (ms).
+_PG_TIMEOUT_MAX_MS = 2_147_483_647
+
+
+@contextmanager
+def _bounded_session(db, timeout: float | None) -> Iterator[None]:
+    """Bound this session's DB work by ``timeout`` seconds where the stack
+    allows it (B9a-r2 M4).
+
+    Postgres: ``SET LOCAL statement_timeout`` + ``lock_timeout`` (they end
+    with this transaction). SQLite: ``PRAGMA busy_timeout`` for the lock
+    wait, restored afterwards (the pooled connection keeps its own value).
+    A limit already in force is never loosened (B9a-r3 M2): the value set
+    is min(existing, budget). Postgres 0 means "no limit", so the budget
+    applies; SQLite busy_timeout 0 means "never wait for a lock", which is
+    already stricter than any budget and is kept. NOT bounded: the wait for a pooled connection (engine ``pool_timeout``)
+    and opening a new connection (no per-call connect timeout on the shared
+    engine) — ADR-0014 B9a-r2.
+    """
+    if timeout is None:
+        yield
+        return
+    ms = min(_PG_TIMEOUT_MAX_MS, max(1, math.ceil(timeout * 1000)))
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy import text  # noqa: PLC0415 (deferred: rarely used)
+
+        # pg_settings.setting is in the base unit (ms) for both; 0 = no limit.
+        current = dict(
+            db.execute(
+                text(
+                    "SELECT name, setting FROM pg_settings "
+                    "WHERE name IN ('statement_timeout', 'lock_timeout')"
+                )
+            ).all()
+        )
+        for name in ("statement_timeout", "lock_timeout"):
+            existing = int(current.get(name) or 0)
+            value = ms if existing <= 0 else min(existing, ms)
+            db.execute(text(f"SET LOCAL {name} = {value}"))
+        yield
+        return
+    if dialect == "sqlite":
+        conn = db.connection()
+        previous = int(conn.exec_driver_sql("PRAGMA busy_timeout").scalar() or 0)
+        # 0 (never wait) is kept: min() never loosens it.
+        conn.exec_driver_sql(f"PRAGMA busy_timeout = {min(previous, ms)}")
+        try:
+            yield
+        finally:
+            conn.exec_driver_sql(f"PRAGMA busy_timeout = {previous}")
+        return
+    yield
+
+
+def resolve_model(model_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+    """The entry a worker executes for ``model_id``, for a caller without a
+    DB session (B9 M3: restoring a persisted provider job handle).
+
+    The pinned entry (``pinned_model``) when it is this model's; else the DB
+    overlay read in its own session (``get_model(model_id, db)``: DB row
+    first, the seed only when the model has no row). A failing DB read is
+    MODEL_UNAVAILABLE, never a silent fallback to the seed.
+
+    ``timeout`` (seconds left in the caller's budget) bounds the DB work
+    where the stack allows it (``_bounded_session``; B9a-r2 M4); no time
+    left -> MODEL_UNAVAILABLE without touching the DB.
+    """
+    pinned = _pinned.get()
+    if pinned is not None and pinned.get("model_id") == model_id:
+        return pinned
+    if timeout is not None and timeout <= 0:
+        raise StudioError(
+            ErrorCode.MODEL_UNAVAILABLE,
+            f"Model {model_id}: no time left to read the registry entry from "
+            "the database.",
+            details={"reason": "deadline_exceeded"},
+        )
+    from app.db.session import session_scope  # noqa: PLC0415 (deferred: as seed.py)
+
+    try:
+        with session_scope() as db, _bounded_session(db, timeout):
+            return get_model(model_id, db)
+    except StudioError:
+        raise
+    except Exception as exc:  # noqa: BLE001 (DB unavailable: reported, never seed)
+        raise StudioError(
+            ErrorCode.MODEL_UNAVAILABLE,
+            f"Model {model_id}: the registry entry could not be read from the "
+            f"database ({type(exc).__name__}); not falling back to the seed.",
+        ) from exc
 
 
 def list_models(db=None, *, active_only: bool = True) -> list[dict[str, Any]]:

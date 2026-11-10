@@ -2428,3 +2428,773 @@ def test_b7r3_review_m1_deadline_error_never_quotes_a_cut_secret(env, monkeypatc
     # No 24-char window of the secret may appear anywhere in the message.
     leaked = [secret[i:i + 24] for i in range(0, len(secret) - 24) if secret[i:i + 24] in row.error_message]
     assert leaked == [], row.error_message
+
+
+# ---------------------------------------------------------------------------
+# B9a: restored handles (M2 deadline, M3 config), connect bound per address +
+# DNS (M4), configured headers on cross-origin redirects (M5)
+# ---------------------------------------------------------------------------
+
+
+class _ClockDrip(httpx.SyncByteStream):
+    """A body whose every chunk "takes" ``step`` seconds on the fake clock."""
+
+    def __init__(self, clock, data: bytes, *, size: int, step: float):
+        self.clock, self.data, self.size, self.step = clock, data, size, step
+        self.read = 0
+
+    def __iter__(self):
+        for start in range(0, len(self.data), self.size):
+            self.clock.now += self.step
+            self.read += 1
+            yield self.data[start : start + self.size]
+
+
+def _restore_setup(monkeypatch, clock, deadline: float) -> None:
+    monkeypatch.setattr(http_polling, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(http_polling, "_sleep", clock.sleep)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", deadline)
+    monkeypatch.setattr(defaults, "POLL_INTERVAL_MAX_SEC", 0.0)
+    monkeypatch.setenv("FAKE_REF_KEY", "k")
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: PLAIN_MODEL)
+
+
+def test_b9_m2_restored_handle_poll_is_bounded_by_one_new_deadline(monkeypatch):
+    """Review B9 M2: a fresh adapter restoring a persisted handle kept no
+    deadline, so poll_until_done's local deadline never reached the HTTP
+    layer and a dripping status body ran far past it. The restore stores ONE
+    new total deadline that deadline_for() and the HTTP calls share."""
+    clock = _Clock()
+    _restore_setup(monkeypatch, clock, 30.0)
+    cancels: list[str] = []
+
+    def handler(req):
+        if req.url.path.endswith("/cancel"):
+            cancels.append(req.url.path)
+            return httpx.Response(200, json={})
+        if req.url.path == "/v1/jobs/j1":
+            body = b'{"state": "QUEUED", "pad": "' + b"x" * 40 + b'"}'
+            return httpx.Response(200, stream=_ClockDrip(clock, body, size=1, step=5.0))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    handle = http_polling.job_handle("j1", "fake.plain-t2i")
+    fresh = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    started = clock.now
+    with pytest.raises(StudioError) as ei:
+        poll_until_done(fresh, handle)
+    assert ei.value.details.get("reason") == "deadline_exceeded", ei.value.message
+    # Stopped at the new deadline (one 5 s chunk of slack), not after the
+    # whole ~350 s drip.
+    assert clock.now - started <= 30.0 + 5.0, clock.now - started
+    assert fresh.deadline_for(handle) == pytest.approx(started + 30.0)
+    assert cancels == ["/v1/jobs/j1/cancel"]
+
+
+def test_b9_m2_restored_handle_result_fetch_shares_the_same_deadline(monkeypatch):
+    """The deadline set at restore also bounds fetch_result (status + a
+    dripping download); it is not restarted per call."""
+    clock = _Clock()
+    _restore_setup(monkeypatch, clock, 30.0)
+    image = _png(size=(32, 32))
+
+    def handler(req):
+        if req.url.path == "/v1/jobs/j1":
+            return httpx.Response(
+                200, json={"state": "DONE", "url": "https://cdn.ref.test/out.png"}
+            )
+        if req.url.host == "cdn.ref.test":
+            return httpx.Response(
+                200, headers={"content-type": "image/png"},
+                stream=_ClockDrip(clock, image, size=4, step=5.0),
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    handle = http_polling.job_handle("j1", "fake.plain-t2i")
+    fresh = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    started = clock.now
+    assert fresh.poll(handle).state == "succeeded"
+    deadline = fresh.deadline_for(handle)
+    assert deadline == pytest.approx(started + 30.0)
+    clock.now += 20.0  # time passes between the poll and the result fetch
+    with pytest.raises(StudioError) as ei:
+        fresh.fetch_result(handle)
+    assert ei.value.details.get("reason") == "deadline_exceeded", ei.value.message
+    assert fresh.deadline_for(handle) == deadline  # one deadline, not restarted
+    assert clock.now - started <= 30.0 + 5.0, clock.now - started
+
+
+def _moved_model(host: str) -> dict:
+    model = _endpoint_model(host)
+    model["model_id"] = "fake.moved-t2i"
+    return model
+
+
+def test_b9_m3_restore_uses_the_db_overlay_not_the_seed(env, monkeypatch):
+    """Review B9 M3: the restore path read the SEED config while the worker
+    pins the DB overlay. Seed endpoint A, DB row endpoint B: a restored
+    handle must poll B (implicitly and through the explicit API), and a
+    DB that cannot be read is an error, never a silent seed fallback."""
+    monkeypatch.setenv("FAKE_REF_KEY", "k")
+    _register_model(monkeypatch, _moved_model("a"))  # seed cache + DB row (A)
+    _set_db_caps(_moved_model("b"))  # operator edit: the DB row now says B
+    hits: list[str] = []
+
+    def handler(req):
+        hits.append(f"{req.method} {req.url.host.split('.')[0]} {req.url.path}")
+        return httpx.Response(200, json={"state": "QUEUED"})
+
+    handle = http_polling.job_handle("1", "fake.moved-t2i")
+    assert HttpPollingAdapter(transport=httpx.MockTransport(handler)).poll(handle).state == "queued"
+    assert hits == ["GET b /v1/jobs/1"]
+
+    # Explicit API: the caller passes the entry it resolved (worker: DB overlay).
+    hits.clear()
+    explicit = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    with session_scope() as db:
+        entry = registry.get_model("fake.moved-t2i", db)
+    explicit.restore(handle, entry)
+    assert explicit.deadline_for(handle) is not None
+    assert explicit.poll(handle).state == "queued"
+    assert hits == ["GET b /v1/jobs/1"]
+    with pytest.raises(StudioError) as ei:  # entry of another model: refused
+        HttpPollingAdapter(transport=httpx.MockTransport(handler)).restore(
+            handle, _endpoint_model("b")
+        )
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE
+
+    # DB unreadable -> MODEL_UNAVAILABLE, no request to the seed endpoint.
+    hits.clear()
+
+    def _broken():
+        raise RuntimeError("database is down")
+
+    monkeypatch.setattr(sess_mod, "get_session_factory", _broken)
+    with pytest.raises(StudioError) as ei:
+        HttpPollingAdapter(transport=httpx.MockTransport(handler)).poll(handle)
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE, ei.value.message
+    assert hits == []
+
+
+class _FakeConnectSockets:
+    """Patches socket.getaddrinfo / socket.socket so the REAL httpx transport
+    (httpcore SyncBackend -> socket.create_connection) runs against
+    controlled sockets: no packet leaves the process."""
+
+    def __init__(
+        self, monkeypatch, *, names: dict, connect, getaddrinfo_hook=None, infos=None
+    ):
+        import socket as socket_mod
+
+        self.attempts: list[tuple[str, float | None]] = []
+        # (socket family, full sockaddr) of every connect (B9a-r2 M3).
+        self.sockaddrs: list[tuple[int, tuple]] = []
+        outer = self
+
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if getaddrinfo_hook is not None:
+                getaddrinfo_hook(host)
+            if infos is not None and host in infos:
+                return list(infos[host])  # raw addrinfo tuples (e.g. AF_INET6)
+            addresses = names.get(host, [host])
+            return [
+                (socket_mod.AF_INET, socket_mod.SOCK_STREAM, 6, "", (a, port))
+                for a in addresses
+            ]
+
+        class FakeSocket:
+            def __init__(self, family=-1, *a, **k):
+                self.family = family
+                self.timeout = None
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def setsockopt(self, *a):
+                pass
+
+            def bind(self, *a):
+                pass
+
+            def close(self):
+                pass
+
+            def connect(self, sockaddr):
+                outer.sockaddrs.append((self.family, tuple(sockaddr)))
+                outer.attempts.append((sockaddr[0], self.timeout))
+                connect(sockaddr[0], self.timeout)
+
+        monkeypatch.setattr(socket_mod, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(socket_mod, "socket", FakeSocket)
+
+
+def _socket_model(host: str) -> dict:
+    model = json.loads(json.dumps(PLAIN_MODEL))
+    model["model_id"] = "fake.sock-t2i"
+    http = model["capabilities"]["http"]
+    http["submit"]["url"] = f"http://{host}:8080/v1/generate"
+    http["submit"]["headers"] = {}
+    http["status"]["url_template"] = f"http://{host}:8080/v1/jobs/{{job_id}}"
+    http["cancel"] = {"url_template": f"http://{host}:8080/v1/jobs/{{job_id}}/cancel"}
+    return model
+
+
+def test_b9_m4_connect_attempts_share_the_deadline_across_addresses(monkeypatch):
+    """Review B9 M4: the connect timeout was computed once and the stdlib
+    re-applied it per resolved address, so two addresses took ~2x the time
+    left. The first address refuses after 4 s, the second blackholes: it must
+    get only the 6 s left, and the call ends at the deadline."""
+    import socket as socket_mod
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    clock = _Clock()
+    monkeypatch.setattr(http_polling, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 10.0)
+    model = _socket_model("dual.test")
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+
+    def connect(address, timeout):
+        if address == "10.255.0.1":
+            clock.now += 4.0
+            raise ConnectionRefusedError(61, "refused")
+        clock.now += timeout  # blackhole: the whole timeout passes
+        raise socket_mod.timeout("timed out")
+
+    fake = _FakeConnectSockets(
+        monkeypatch, names={"dual.test": ["10.255.0.1", "10.255.0.2"]}, connect=connect
+    )
+    adapter = HttpPollingAdapter()  # real transport, controlled sockets
+    started = clock.now
+    with pytest.raises(StudioError) as ei:
+        adapter.submit("fake.sock-t2i", _PLAIN_PAYLOAD)
+    assert ei.value.details.get("reason") == "deadline_exceeded", ei.value.message
+    assert [a for a, _ in fake.attempts] == ["10.255.0.1", "10.255.0.2"]
+    assert [t for _, t in fake.attempts] == pytest.approx([10.0, 6.0])
+    assert clock.now - started == pytest.approx(10.0)
+
+
+def test_b9_m4_dns_resolution_is_bounded_for_calls_and_cancel(monkeypatch):
+    """Review B9 M4: getaddrinfo had no bound. A resolver that hangs must
+    not stretch a job call past its deadline, nor cancel past its cap."""
+    import threading
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(defaults, "HTTP_CANCEL_TIMEOUT_SEC", 0.3)
+    model = _socket_model("slowdns.test")
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+    release = threading.Event()
+
+    def hang(host):
+        if host == "slowdns.test":
+            release.wait(5.0)
+
+    def refuse(address, timeout):
+        raise ConnectionRefusedError(61, "refused")
+
+    _FakeConnectSockets(
+        monkeypatch, names={"slowdns.test": ["10.255.0.9"]}, connect=refuse,
+        getaddrinfo_hook=hang,
+    )
+    adapter = HttpPollingAdapter()
+    try:
+        started = time.monotonic()
+        with pytest.raises(StudioError) as ei:
+            adapter.submit("fake.sock-t2i", _PLAIN_PAYLOAD)
+        elapsed = time.monotonic() - started
+        assert ei.value.details.get("reason") == "deadline_exceeded", ei.value.message
+        assert elapsed < 0.3 + _DRIP_MARGIN, f"submit took {elapsed:.2f}s"
+
+        started = time.monotonic()
+        adapter.cancel(http_polling.job_handle("j1", "fake.sock-t2i"))  # best effort
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.3 + _DRIP_MARGIN, f"cancel took {elapsed:.2f}s"
+    finally:
+        release.set()
+
+
+def _header_model() -> dict:
+    model = json.loads(json.dumps(PLAIN_MODEL))
+    model["capabilities"]["http"]["submit"]["headers"] = {
+        "Authorization": "env:FAKE_REF_KEY",
+        "X-API-Key": "env:FAKE_REF_KEY",
+        "X-Tenant": "studio",
+    }
+    return model
+
+
+_CONFIGURED = ("authorization", "x-api-key", "x-tenant")
+
+
+@pytest.mark.parametrize(
+    "hops,kept",
+    [
+        (["/v1/next"], True),  # same origin
+        (["https://other.test/v1/next"], False),  # host
+        (["http://ref.test/v1/next"], False),  # scheme
+        (["https://ref.test:8443/v1/next"], False),  # port
+        (["https://other.test/v1/hop", "https://ref.test/v1/next"], False),  # back
+    ],
+    ids=["same-origin", "host", "scheme", "port", "back-to-origin"],
+)
+def test_b9_m5_cross_origin_redirect_drops_every_configured_header(
+    monkeypatch, hops, kept
+):
+    """Review B9 M5: httpx strips only Authorization on a cross-origin
+    redirect; X-API-Key-style auth headers from the seed config went to the
+    other origin. Any cross-origin hop now drops every configured header
+    (also on a later hop back); a same-origin hop keeps them."""
+    monkeypatch.setenv("FAKE_REF_KEY", "secret-k")
+    model = _header_model()
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+    seen: dict[str, httpx.Headers] = {}
+    chain = list(hops)
+
+    def handler(req):
+        seen[str(req.url)] = req.headers
+        if req.url.path == "/v1/next":
+            return httpx.Response(200, json={"id": "j1"})
+        return httpx.Response(307, headers={"location": chain.pop(0)})
+
+    adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    assert adapter.submit("fake.plain-t2i", _PLAIN_PAYLOAD).startswith("j1@")
+    first = seen.pop("https://ref.test/v1/generate")
+    assert all(name in first for name in _CONFIGURED)
+    final = next(h for url, h in seen.items() if url.endswith("/v1/next"))
+    for headers in seen.values():
+        present = [name for name in _CONFIGURED if name in headers]
+        if kept:
+            assert present == list(_CONFIGURED)
+        else:
+            assert present == [], present
+    assert final.get("content-type") == "application/json"  # body still framed
+
+
+# ---------------------------------------------------------------------------
+# B9a-r2 (Codex review of B9a): M1 seed framing values across origins, M2
+# resolver thread cap, M3 IPv6 scope, M4 restore/cancel bounds start before
+# the registry read, M5 explicit model id on a cached handle, M6 mismatch
+# message never quotes the remote id
+# ---------------------------------------------------------------------------
+
+
+_CT_SECRET = "application/json; api_key=ct-secret-4242"
+
+
+@pytest.mark.parametrize(
+    "status,location,method,expected_ct",
+    [
+        (307, "https://other.test/v1/next", "POST", "application/json"),
+        (303, "https://other.test/v1/next", "GET", None),
+        (307, "/v1/next", "POST", _CT_SECRET),  # same origin: the seed's own value
+    ],
+    ids=["307-cross-resend", "303-cross-get", "307-same-origin"],
+)
+def test_b9a_r2_m1_seed_content_type_value_never_crosses_origins(
+    monkeypatch, status, location, method, expected_ct
+):
+    """Review B9a-r2 M1: Content-Type was kept verbatim from the seed on a
+    cross-origin hop, so an env: value carrying a credential went to the
+    other origin. Across origins a seed-set framing header is re-derived
+    from the body (as httpx generates it) or dropped when no body is
+    re-sent; a same-origin hop is unchanged."""
+    monkeypatch.setenv("FAKE_REF_KEY", "secret-k")
+    monkeypatch.setenv("B9_CT", _CT_SECRET)
+    model = _header_model()
+    model["capabilities"]["http"]["submit"]["headers"]["Content-Type"] = "env:B9_CT"
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+    seen: list[tuple[str, str, httpx.Headers, bytes]] = []
+
+    def handler(req):
+        seen.append((str(req.url), req.method, req.headers, req.content))
+        if req.url.path == "/v1/next":
+            return httpx.Response(200, json={"id": "j1"})
+        return httpx.Response(status, headers={"location": location})
+
+    adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    assert adapter.submit("fake.plain-t2i", _PLAIN_PAYLOAD).startswith("j1@")
+    assert seen[0][2].get("content-type") == _CT_SECRET  # the origin gets the seed's
+    _url, sent_method, headers, content = seen[1]
+    assert sent_method == method
+    assert headers.get("content-type") == expected_ct
+    if expected_ct != _CT_SECRET:
+        assert [v for v in headers.values() if "ct-secret" in v] == []
+    if method == "POST":
+        assert json.loads(content) == json.loads(seen[0][3])  # same body, re-framed
+        assert headers.get("content-length") == str(len(content))
+    else:
+        assert content == b""
+
+
+def test_b9a_r2_m1_seed_framed_multipart_is_not_resent_to_another_origin(monkeypatch):
+    """A multipart body framed by a seed Content-Type (its boundary is seed
+    data) cannot be re-derived: the cross-origin re-send is refused with a
+    clear error and nothing reaches the other origin."""
+    hosts: list[str] = []
+
+    def handler(req):
+        hosts.append(req.url.host)
+        if req.url.host == "other.test":
+            return httpx.Response(200, json={"name": "x.png"})
+        return httpx.Response(307, headers={"location": "https://other.test/upload"})
+
+    adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(StudioError) as ei:
+        adapter._call(
+            "POST", "https://ref.test/upload",
+            headers={"Content-Type": "multipart/form-data; boundary=seed-b0undary"},
+            data={"type": "input"}, files={"image": ("x.png", b"123", "image/png")},
+            timeout=5.0, what="Input upload", deadline=None,
+        )
+    assert ei.value.details.get("reason") == "redirect_reframe_refused", ei.value.message
+    assert hosts == ["ref.test"]
+
+
+def _dns_threads() -> list:
+    import threading
+
+    return [t for t in threading.enumerate() if t.name == "http-polling-dns" and t.is_alive()]
+
+
+def _until(predicate, limit: float = 5.0) -> bool:
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_b9a_r2_m2_resolver_threads_are_capped_process_wide(monkeypatch):
+    """Review B9a-r2 M2: every DNS timeout left one resolver thread behind
+    and nothing capped their number. With the cap at 2, five calls against a
+    hanging resolver leave at most 2 threads; calls 3-5 wait for a slot
+    inside their own deadline and fail with the deadline error. A slot is
+    freed only when its resolver returns."""
+    import threading
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 0.2)
+    monkeypatch.setattr(defaults, "HTTP_DNS_MAX_RESOLVER_THREADS", 2, raising=False)
+    model = _socket_model("slowdns.test")
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+    release = threading.Event()
+    lookups: list[str] = []
+
+    def hang(host):
+        if host == "slowdns.test":
+            lookups.append(host)
+            release.wait(10.0)
+
+    def refuse(address, timeout):
+        raise ConnectionRefusedError(61, "refused")
+
+    _FakeConnectSockets(
+        monkeypatch, names={"slowdns.test": ["10.255.0.9"]}, connect=refuse,
+        getaddrinfo_hook=hang,
+    )
+    assert _until(lambda: not _dns_threads()), "resolvers of an earlier test still run"
+    adapter = HttpPollingAdapter()
+    try:
+        for _ in range(5):
+            started = time.monotonic()
+            with pytest.raises(StudioError) as ei:
+                adapter.submit("fake.sock-t2i", _PLAIN_PAYLOAD)
+            elapsed = time.monotonic() - started
+            assert ei.value.details.get("reason") == "deadline_exceeded", ei.value.message
+            assert elapsed < 0.2 + _DRIP_MARGIN, f"submit took {elapsed:.2f}s"
+        assert len(_dns_threads()) <= 2, _dns_threads()
+        assert len(lookups) == 2
+    finally:
+        release.set()
+    assert _until(lambda: not _dns_threads())
+    lookups.clear()
+    with pytest.raises(StudioError) as ei:  # slots free again: resolves, then refused
+        adapter.submit("fake.sock-t2i", _PLAIN_PAYLOAD)
+    assert lookups == ["slowdns.test"]
+    assert ei.value.details.get("reason") != "deadline_exceeded", ei.value.message
+
+
+def test_b9a_r2_m3_scoped_ipv6_address_keeps_its_scope_and_family(monkeypatch):
+    """Review B9a-r2 M3: the resolved address was reduced to its IP string,
+    so link-local ('fe80::1234', port, 0, 7) was connected on scope 0 (and
+    re-resolved as whatever family the stdlib picked). Each attempt now uses
+    the full sockaddr and family; de-duplication keeps the same IP on two
+    interfaces apart."""
+    import socket as socket_mod
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 30.0)
+    model = _socket_model("lan.test")
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: model)
+    v6 = socket_mod.AF_INET6
+    stream = socket_mod.SOCK_STREAM
+    scoped7 = ("fe80::1234", 8080, 0, 7)
+    scoped9 = ("fe80::1234", 8080, 0, 9)
+    infos = {"lan.test": [
+        (v6, stream, 6, "", scoped7),
+        (v6, stream, 6, "", scoped9),  # same IP, another interface
+        (v6, stream, 6, "", scoped7),  # duplicate
+    ]}
+
+    def refuse(address, timeout):
+        raise ConnectionRefusedError(61, "refused")
+
+    fake = _FakeConnectSockets(monkeypatch, names={}, connect=refuse, infos=infos)
+    with pytest.raises(StudioError):
+        HttpPollingAdapter().submit("fake.sock-t2i", _PLAIN_PAYLOAD)
+    assert fake.sockaddrs == [(v6, scoped7), (v6, scoped9)]
+
+
+def test_b9a_r2_m4_restore_and_cancel_bounds_start_before_the_registry_read(monkeypatch):
+    """Review B9a-r2 M4: the job deadline (restore) and cancel's cap started
+    only AFTER the registry/DB read, so a slow read was outside both bounds.
+    Both now start at entry, and the read gets the time left as its bound."""
+    clock = _Clock()
+    monkeypatch.setattr(http_polling, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 30.0)
+    monkeypatch.setattr(defaults, "HTTP_CANCEL_TIMEOUT_SEC", 10.0)
+    monkeypatch.setenv("FAKE_REF_KEY", "k")
+    budgets: list[float | None] = []
+    delay = {"sec": 8.0}
+
+    def slow_resolve(model_id, timeout=None):
+        budgets.append(timeout)
+        clock.now += delay["sec"]  # the registry read "takes" this long
+        return PLAIN_MODEL
+
+    monkeypatch.setattr(registry, "resolve_model", slow_resolve)
+    cancel_timeouts: list[float] = []
+
+    def handler(req):
+        cancel_timeouts.append(req.extensions["timeout"]["connect"])
+        return httpx.Response(200, json={})
+
+    handle = http_polling.job_handle("j1", "fake.plain-t2i")
+    HttpPollingAdapter(transport=httpx.MockTransport(handler)).cancel(handle)
+    assert budgets == [pytest.approx(10.0)]  # the read is bounded by the cap
+    assert cancel_timeouts == [pytest.approx(2.0)]  # 10 s cap - 8 s read
+
+    delay["sec"] = 12.0  # the read alone uses up the cap: no cancel request
+    HttpPollingAdapter(transport=httpx.MockTransport(handler)).cancel(handle)
+    assert len(cancel_timeouts) == 1
+
+    delay["sec"] = 5.0
+    fresh = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    started = clock.now
+    fresh.restore(handle)
+    assert budgets[-1] == pytest.approx(30.0)
+    assert fresh.deadline_for(handle) == pytest.approx(started + 30.0)  # not +35
+
+
+def _probe_registry_read(monkeypatch, read_setting) -> dict:
+    seen: dict = {}
+    real_get = registry.get_model
+
+    def probe(mid, db=None):
+        if db is not None:
+            seen["inside"] = read_setting(db)
+        return real_get(mid, db)
+
+    monkeypatch.setattr(registry, "get_model", probe)
+    return seen
+
+
+def test_b9a_r2_m4_sqlite_registry_read_gets_a_busy_timeout(env, monkeypatch):
+    """SQLite: the restore read runs with busy_timeout = the time left, and
+    the pooled connection gets its own value back afterwards."""
+    from tests.conftest import postgres_tests_enabled
+
+    if postgres_tests_enabled():
+        pytest.skip("SQLite variant (TEST_DATABASE_URL selects Postgres)")
+
+    def busy(db):
+        return db.connection().exec_driver_sql("PRAGMA busy_timeout").scalar()
+
+    _register_model(monkeypatch, _moved_model("a"))
+    with session_scope() as db:
+        before = busy(db)
+    seen = _probe_registry_read(monkeypatch, busy)
+    assert registry.resolve_model("fake.moved-t2i", timeout=2.5)["model_id"] == "fake.moved-t2i"
+    assert seen["inside"] == 2500
+    with session_scope() as db:
+        assert busy(db) == before
+    with pytest.raises(StudioError) as ei:  # no time left: the DB is not touched
+        registry.resolve_model("fake.moved-t2i", timeout=0.0)
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE
+
+
+def test_b9a_r2_m4_postgres_registry_read_gets_local_statement_timeouts(env, monkeypatch):
+    """Postgres (TEST_DATABASE_URL only): the restore read runs with SET LOCAL
+    statement_timeout / lock_timeout = the time left; nothing leaks into the
+    next transaction on the pooled connection."""
+    from sqlalchemy import text
+
+    from tests.conftest import postgres_tests_enabled
+
+    if not postgres_tests_enabled():
+        pytest.skip("Postgres variant: set TEST_DATABASE_URL")
+
+    def timeouts(db):
+        return (
+            db.execute(text("SHOW statement_timeout")).scalar(),
+            db.execute(text("SHOW lock_timeout")).scalar(),
+        )
+
+    _register_model(monkeypatch, _moved_model("a"))
+    with session_scope() as db:
+        before = timeouts(db)
+    seen = _probe_registry_read(monkeypatch, timeouts)
+    assert registry.resolve_model("fake.moved-t2i", timeout=2.5)["model_id"] == "fake.moved-t2i"
+    assert seen["inside"] == ("2500ms", "2500ms")
+    with session_scope() as db:
+        assert timeouts(db) == before
+
+
+def test_b9a_r2_m5_cached_handle_still_checks_an_explicit_model_id(monkeypatch):
+    """Review B9a-r2 M5: a handle the adapter already tracked returned before
+    the explicit model-id check, so restore(handle, wrong entry) succeeded
+    after a correct restore (or after submit). The check now runs first."""
+    monkeypatch.setenv("FAKE_REF_KEY", "k")
+    models = {m["model_id"]: m for m in (_endpoint_model("a"), _endpoint_model("b"))}
+    monkeypatch.setattr(registry, "get_model", lambda mid, db=None: models[mid])
+
+    def handler(req):
+        if req.url.path == "/v1/generate":
+            return httpx.Response(200, json={"id": "1"})
+        return httpx.Response(200, json={"state": "QUEUED"})
+
+    adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
+    handle = http_polling.job_handle("1", "fake.a-t2i")
+    adapter.restore(handle, models["fake.a-t2i"])
+    deadline = adapter.deadline_for(handle)
+    with pytest.raises(StudioError) as ei:
+        adapter.restore(handle, models["fake.b-t2i"])
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE
+    adapter.restore(handle, models["fake.a-t2i"])  # the right id: state kept
+    assert adapter.deadline_for(handle) == deadline
+
+    submitted = adapter.submit("fake.a-t2i", _PLAIN_PAYLOAD)  # cached by submit
+    with pytest.raises(StudioError) as ei:
+        adapter.restore(submitted, models["fake.b-t2i"])
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE
+
+
+def test_b9a_r2_m6_restore_failure_never_quotes_the_remote_id(monkeypatch):
+    """Review B9a-r2 M6: the mismatch error quoted the handle before this
+    model's secrets were collected, so a remote id reflecting a known env
+    secret appeared in it. The message names model ids only."""
+    secret = "m6-known-secret-" + "z9" * 20
+    monkeypatch.setenv("FAKE_REF_KEY", secret)
+    fresh = HttpPollingAdapter(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+
+    def leaked(text: str) -> list[str]:
+        return [secret[i:i + 24] for i in range(len(secret) - 23) if secret[i:i + 24] in text]
+
+    handle = http_polling.job_handle(secret, "fake.plain-t2i")
+    with pytest.raises(StudioError) as ei:
+        fresh.restore(handle, _endpoint_model("b"))
+    assert ei.value.code == ErrorCode.MODEL_UNAVAILABLE
+    assert "fake.plain-t2i" in ei.value.message and "fake.b-t2i" in ei.value.message
+    assert leaked(ei.value.message) == [], ei.value.message
+    assert leaked(str(ei.value)) == []
+    with pytest.raises(StudioError) as ei:  # not a handle at all: not quoted either
+        fresh.restore(secret)
+    assert leaked(ei.value.message) == [], ei.value.message
+
+
+# ---------------------------------------------------------------------------
+# B9a-r3 (Codex review of B9a-r2): M1 a failed restore never restarts the job
+# budget, M2 the DB bound never loosens a limit already in force
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "read_sec,expected_budgets,elapsed",
+    [
+        (10.0, [10.0, 2.0], 12.0),  # the first read uses the whole budget
+        (3.0, [10.0, 7.0, 2.0], 8.0),  # a quick failure: the retry gets only what is left
+    ],
+    ids=["read-exhausts-budget", "read-fails-early"],
+)
+def test_b9a_r3_m1_failed_restore_never_restarts_the_job_budget(
+    monkeypatch, read_sec, expected_budgets, elapsed
+):
+    """Review B9R2-M1: when the restore inside deadline_for failed, the error
+    was dropped, poll_until_done started a fresh local deadline and poll()'s
+    re-restore got a fresh full budget again (budgets [10, 10, 2], 22 s for a
+    10 s job). The deadline the first attempt started is kept; only cancel's
+    own cap (2 s) comes on top, and it does not extend the job budget."""
+    clock = _Clock()
+    monkeypatch.setattr(http_polling, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(http_polling, "_sleep", clock.sleep)
+    monkeypatch.setattr(defaults, "HTTP_JOB_TOTAL_DEADLINE_SEC", 10.0)
+    monkeypatch.setattr(defaults, "HTTP_CANCEL_TIMEOUT_SEC", 2.0)
+    monkeypatch.setattr(defaults, "POLL_INTERVAL_MAX_SEC", 0.0)
+    budgets: list[float] = []
+
+    def failing_read(model_id, timeout=None):
+        budgets.append(timeout)
+        clock.now += min(read_sec, timeout)  # the read consumes its budget, then fails
+        raise StudioError(ErrorCode.MODEL_UNAVAILABLE, "registry read failed")
+
+    monkeypatch.setattr(registry, "resolve_model", failing_read)
+    fresh = HttpPollingAdapter(
+        transport=httpx.MockTransport(lambda r: pytest.fail(f"no request expected: {r.url}"))
+    )
+    handle = http_polling.job_handle("j1", "fake.plain-t2i")
+    started = clock.now
+    with pytest.raises(StudioError):
+        poll_until_done(fresh, handle)
+    assert budgets == pytest.approx(expected_budgets)
+    assert clock.now - started == pytest.approx(elapsed)
+    assert fresh.deadline_for(handle) == pytest.approx(started + 10.0)  # never restarted
+
+
+def _sqlite_busy(db) -> int:
+    return db.connection().exec_driver_sql("PRAGMA busy_timeout").scalar()
+
+
+@pytest.mark.parametrize(
+    "existing,budget,inside",
+    [(5000, 60.0, 5000), (5000, 2.5, 2500), (0, 2.5, 0)],
+    ids=["budget-larger-keeps-existing", "budget-smaller-applies", "zero-never-waits"],
+)
+def test_b9a_r3_m2_sqlite_bound_never_loosens_busy_timeout(env, existing, budget, inside):
+    """Review B9R2-M2: the restore read set busy_timeout to the caller budget
+    even when the connection already had a shorter one (5000 ms -> 6,000,000
+    ms). The value is min(existing, budget); 0 (never wait) is kept."""
+    from tests.conftest import postgres_tests_enabled
+
+    if postgres_tests_enabled():
+        pytest.skip("SQLite variant (TEST_DATABASE_URL selects Postgres)")
+    with session_scope() as db:
+        original = _sqlite_busy(db)
+        db.connection().exec_driver_sql(f"PRAGMA busy_timeout = {existing}")
+        try:
+            with registry._bounded_session(db, budget):
+                assert _sqlite_busy(db) == inside
+            assert _sqlite_busy(db) == existing
+        finally:
+            db.connection().exec_driver_sql(f"PRAGMA busy_timeout = {original}")
+
+
+def test_b9a_r3_m2_postgres_bound_never_loosens_a_finite_limit(env):
+    """Postgres (TEST_DATABASE_URL only): a finite statement_timeout already in
+    force is kept when the budget is larger; an unlimited one (0) gets the
+    budget."""
+    from sqlalchemy import text
+
+    from tests.conftest import postgres_tests_enabled
+
+    if not postgres_tests_enabled():
+        pytest.skip("Postgres variant: set TEST_DATABASE_URL")
+    with session_scope() as db:
+        db.execute(text("SET LOCAL statement_timeout = 1000"))
+        db.execute(text("SET LOCAL lock_timeout = 0"))
+        with registry._bounded_session(db, 60.0):
+            assert db.execute(text("SHOW statement_timeout")).scalar() == "1s"
+            assert db.execute(text("SHOW lock_timeout")).scalar() == "1min"

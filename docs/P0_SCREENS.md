@@ -23,7 +23,8 @@
 
 - 헤더 우측 잡 뱃지: `GET /jobs?status=queued`로 초기 개수를 받고, 이후 SSE `job.progress`로 증감한다.
   클릭 시 드롭다운: 진행 중 잡 목록 (`job_type`, `progress_pct`, `stage`, `eta_sec?`).
-  각 행 클릭 → 해당 잡이 속한 화면으로 이동. 행 내 취소 버튼 → `DELETE /jobs/{id}`.
+  각 행 클릭 → 해당 잡이 속한 화면으로 이동. 행 내 취소 버튼 → `POST /jobs/{id}/cancel` (대기·실행 중 잡만, 아니면 400 `VALIDATION_ERROR`).
+  취소는 낙관적으로 표시하지 않는다: `job.canceled` 이벤트(놓치면 잡 재조회·재연결 보정)로 확정된다.
 - SSE 연결 상태: 헤더에 상태 점 표시 (녹색=연결됨, 황색=재연결 중, 적색=끊김).
   재연결 시 `Last-Event-ID`로 이어받고, 끊겼던 동안의 상태는 `GET /jobs`로 보정한다.
 - SSE 구독은 `lib/sse.ts` 단일 훅만 사용한다. 화면마다 EventSource를 생성하지 않는다.
@@ -134,7 +135,7 @@
 
 **상태 처리**
 - 빈 상태: 로그라인 입력 유도 ("로그라인 한 줄이면 시작할 수 있습니다").
-- 로딩: LLM 생성 중에는 에디터에 "생성 중…" 플레이스홀더 + 잡 뱃지. 취소 가능 (`DELETE /jobs/{id}`).
+- 로딩: LLM 생성 중에는 에디터에 "생성 중…" 플레이스홀더 + 잡 뱃지. 취소 가능 (`POST /jobs/{id}/cancel`).
 - 에러: `422 MODERATION_BLOCKED` 시 "제공자 정책으로 차단됨" 안내 + 프롬프트 수정 유도.
 
 **API·SSE 매핑**
@@ -390,7 +391,7 @@
 | 영역 수정 | `POST /shots/{id}/inpaint` |
 | 승인 | `POST /shots/{id}/frame/approve` |
 | 영상화 | `POST /shots/{id}/video` |
-| 잡 조회·재시도·취소 | `GET /jobs/{id}`, `POST /jobs/{id}/retry`, `DELETE /jobs/{id}` |
+| 잡 조회·재시도·취소 | `GET /jobs/{id}`, `POST /jobs/{id}/retry` (202), `POST /jobs/{id}/cancel` (200) |
 | 모델 목록 | `GET /models?modality=image`, `GET /models?modality=video` |
 | 진행률 | `job.progress`, `job.completed`, `job.failed`, `job.canceled` |
 

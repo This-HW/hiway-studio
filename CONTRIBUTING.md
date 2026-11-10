@@ -18,7 +18,8 @@
   - [ ] `python3 tools/lint_imports.py` 통과 — **의존성 방향 위반 시 커밋 금지**
   - [ ] `python3 -m ruff check services/api/app services/api/tests` 통과 (최소 규칙)
   - [ ] contracts(`packages/contracts/*.json`)를 바꿨으면 `make gen-types` 후 `make gen-types-check` 통과
-  - [ ] web을 바꿨으면 `cd apps/web && npm run typecheck && npm run test:sse && npm run test:resync`
+  - [ ] web을 바꿨으면 `cd apps/web && npm run typecheck && npm run lint && npm run test:sse && npm run test:resync`
+        (`npm run lint`는 ESLint flat config `apps/web/eslint.config.mjs` + `eslint-config-next`. 에러 0이어야 하고 경고는 허용)
   - [ ] 새 설계 결정이 있으면 ADR 작성 (아래)
   - [ ] 새 의존성이 있으면 `docs/licenses.md`에 라이선스 기록
   - [ ] `git status`에 private 파일(`.env`, `projects/`, `library/`, `infra/backups/`)이 없는지 확인

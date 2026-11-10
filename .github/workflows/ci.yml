@@ -67,7 +67,7 @@ jobs:
         run: python -m pytest -q -p no:cacheprovider
 
   web:
-    name: web (typecheck, build, SSE client)
+    name: web (typecheck, lint, build, SSE client)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -83,6 +83,8 @@ jobs:
       - run: npm ci
       - name: G6 typecheck
         run: npx tsc --noEmit
+      - name: G6 lint (ESLint, errors fail)
+        run: npm run lint
       - name: G6 build
         run: npx next build
       - name: G6 SSE client contract

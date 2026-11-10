@@ -83,7 +83,7 @@ export default function LibraryPage() {
       </div>
 
       <div className="notice">
-        업로드 시 저장 위치와 종류를 선택하세요. 저장 위치를 "전역"으로 하면
+        업로드 시 저장 위치와 종류를 선택하세요. 저장 위치를 &ldquo;전역&rdquo;으로 하면
         project_id 없이 올려 모든 프로젝트에서 재사용할 수 있습니다.
         (20MB 제한 · png/jpg/webp/mp4/wav/mp3)
       </div>

@@ -141,3 +141,72 @@
   저장된 맨 원격 id는 예전과 같이 새 프로세스에서 알 수 없는 id다(poll → MODEL_UNAVAILABLE, cancel → no-op).
 - **L1** — 테스트 helper 반환 annotation을 세 값으로 고쳤다.
 - 미검증(그대로): DNS 조회 시간, TLS-in-TLS 프록시 경로의 조각 단위 초과, httpx/httpcore 내부 속성 의존.
+  (DNS 조회 시간과 주소별 connect 누적은 B9 M4에서 해소.)
+
+## B9 (적대적 리뷰 반영, 2026-11-11)
+Codex 리뷰의 http 어댑터 Medium 4건(M2–M5) 반영. 회귀 테스트는 `test_provider_contract.py`의 `test_b9_*`.
+
+- **M2 복원 핸들의 deadline** — 다른 프로세스가 영속된 핸들(`<원격 id>@<model id>#<nonce>`)을 복원하면 설정·원격
+  id·modality만 되살리고 deadline은 없었다. `poll_until_done`이 만든 deadline은 지역 변수라 HTTP 호출에는
+  전달되지 않아, 조금씩 흘리는 status 본문이 deadline을 한참 넘겼다. 결정: **복원한 핸들은 새 총 deadline 하나로
+  시작한다**(복원 시점부터 `HTTP_JOB_TOTAL_DEADLINE_SEC`, 원래 deadline은 복구하지 않는다). 이 값은 어댑터에
+  저장되어 poll·fetch_result가 함께 쓴다. `deadline_for`도 모르는 핸들이면 먼저 복원하므로 `poll_until_done`이
+  읽는 deadline과 HTTP 계층이 지키는 deadline이 같다.
+- **M3 복원 설정 출처** — 복원 경로가 seed 설정을 읽어, DB에서 endpoint를 바꾼 모델의 핸들이 옛 endpoint를
+  poll했다. 명시 API `HttpPollingAdapter.restore(handle, model=None)`을 두었다(poll/fetch/cancel/`deadline_for`는
+  `model=None`으로 암묵 호출). `model`을 주면 그 항목을 쓰고(모델 id가 핸들과 다르면 거절), 없으면
+  `registry.resolve_model`이 워커와 같은 방식으로 해석한다: 고정된 항목(`pinned_model`) → 자체 세션의 DB 행 →
+  DB 행이 없을 때만 seed. DB를 읽지 못하면 `MODEL_UNAVAILABLE`이며 seed로 조용히 대체하지 않는다. 지금 워커와
+  reconcile은 핸들을 복원하지 않는다(D7 그대로).
+- **M4 connect·DNS bound** — connect 래퍼가 남은 시간을 한 번 계산해 넘기면 stdlib `socket.create_connection`이
+  해석된 주소마다 그 timeout을 다시 적용해, 주소 두 개면 deadline의 약 2배가 걸렸고 DNS 조회는 무제한이었다.
+  이제 DNS를 데몬 스레드에서 돌려 남은 시간만큼만 기다리고(IP 리터럴은 조회 생략), 해석된 주소를 하나씩
+  시도하면서 매 시도 전에 남은 시간을 다시 계산한다. 다 쓰면 `ConnectTimeout` → 어댑터 deadline 오류. cancel의
+  절대 상한도 같은 경로를 쓴다. 한계: deadline을 넘겨 멈춘 resolver는 반환될 때까지 데몬 스레드 하나를 남긴다
+  (그 수의 프로세스 상한은 B9a-r2 M2).
+- **M5 교차 origin redirect 헤더** — httpx는 교차 origin redirect에서 `Authorization`만 지워 `X-API-Key` 같은
+  인증 헤더가 다른 origin으로 갔다. 한 hop이라도 원래 origin(scheme·host·port)을 벗어나면 그 체인의 나머지
+  hop에서 seed `headers`에서 온 헤더를 **모두** 뺀다(origin으로 돌아오는 hop 포함). 같은 origin hop은 유지한다.
+  예외는 httpx가 관리하는 프레이밍·표현 헤더(`Host`·`Content-Length`·`Transfer-Encoding`·`Content-Type`·
+  `Accept-Encoding`): 이름은 남기지만, seed가 값을 준 경우 그 값은 다른 origin으로 가지 않는다(B9a-r2 M1).
+- 남은 한계: TLS-in-TLS 프록시 경로의 16 KiB 조각 단위 초과, httpx/httpcore 내부 속성 의존(slow-drip·
+  slow-reader·connect 테스트가 회귀를 잡는다), 실 provider E2E 미검증.
+
+### B9a-r2 (B9a 재리뷰 반영, 2026-11-11)
+Codex의 B9a 리뷰 Medium 6건(B9-M1–M6)을 모두 코드에서 확인하고 반영했다. 회귀 테스트는
+`test_provider_contract.py`의 `test_b9a_r2_*`이다.
+
+- **M1 교차 origin의 프레이밍 헤더 값** — 위 예외 목록 때문에 seed의 `Content-Type: env:X` 값(예:
+  `application/json; api_key=…`)이 307로 다른 origin에 그대로 갔다. 정책: **seed가 준 헤더 값은 어떤 것도
+  원래 origin을 벗어나지 않는다.** 교차 origin hop에서 seed가 준 `Content-Type`·`Content-Length`·
+  `Transfer-Encoding`은 본문에서 다시 만든 값(httpx가 JSON·form·빈 본문에 붙이는 값)으로 바꾸고, 본문을 다시
+  보내지 않는 hop(303 등 GET 전환)에서는 뺀다. multipart 본문은 boundary가 seed 값에서 왔을 수 있어 다시 만들
+  수 없으므로, 다른 origin으로 재전송하지 않고 `redirect_reframe_refused` 오류로 거절한다. `Host`는 httpx가
+  교차 origin hop에서 새 대상으로 다시 쓰고, `Accept-Encoding`은 항상 어댑터의 `identity`다.
+- **M2 resolver 스레드 상한** — DNS timeout마다 데몬 스레드가 하나씩 남았고 그 수에 상한이 없었다. 프로세스
+  전체에서 동시에 도는 resolver 스레드를 `HTTP_DNS_MAX_RESOLVER_THREADS`(8)개로 묶는다. deadline을 넘긴
+  resolver는 실제로 반환할 때까지 슬롯을 계속 잡는다. 슬롯을 기다리는 시간도 같은 deadline에서 빠지며, 그 안에
+  슬롯이 나지 않으면 deadline 오류다. 남는 한계: 상한만큼의 스레드는 resolver가 반환할 때까지 남을 수 있다.
+- **M3 IPv6 scope** — 주소를 IP 문자열로만 넘겨 link-local `('fe80::1234', port, 0, 7)`이 scope 0으로
+  연결되었다. 이제 getaddrinfo의 family와 전체 sockaddr(flow info·scope id 포함)를 connect까지 그대로 넘긴다.
+  httpcore sync backend에서는 어댑터가 그 튜플로 소켓을 직접 연다(`SyncBackend.connect_tcp`와 같은 옵션·
+  TCP_NODELAY·예외 매핑). 다른 backend에는 scope를 `%scope`로 붙인 숫자 주소를 넘긴다. 중복 제거는
+  (family, sockaddr) 기준이라 같은 IP라도 인터페이스가 다르면 따로 시도한다. IP 리터럴은 numeric 변환만 한다.
+- **M4 복원·취소 bound의 시작점** — 모델 해석(DB 조회)이 끝난 뒤에야 잡 deadline과 cancel 상한이 시작되었다.
+  이제 둘 다 `restore`/`cancel` 진입 시점에 시작하고, DB 조회에는 남은 시간을 `registry.resolve_model(timeout=)`로
+  넘긴다. **bound되는 부분**: Postgres는 그 세션 트랜잭션에 `SET LOCAL statement_timeout`·`lock_timeout`(쿼리
+  실행·잠금 대기), SQLite는 그 세션에 `PRAGMA busy_timeout`(잠금 대기, 끝나면 원래 값으로 되돌림). 남은 시간이
+  없으면 DB에 닿지 않고 `MODEL_UNAVAILABLE`. 조회가 cancel 상한을 다 쓰면 cancel 요청은 보내지 않는다(best
+  effort no-op). **bound되지 않는 부분(잔여)**: 풀에서 연결을 기다리는 시간(엔진 `pool_timeout`, 기본 30초)과
+  새 연결을 여는 시간(공유 엔진에 호출별 connect timeout이 없다). 워커 엔진 설정은 바꾸지 않았다. 이 구간이
+  길어지면 restore/cancel 호출은 그만큼 늦어진다. 다만 잡 deadline과 cancel 상한은 진입 시점부터 흐르므로,
+  조회 뒤의 HTTP 호출은 남은 시간만 쓰거나 바로 deadline으로 끝난다.
+- **M5 캐시된 핸들의 모델 검증** — 이미 추적 중인 핸들은 명시 `model`의 id 검증 전에 반환되었다. 이제 검증을
+  캐시 확인보다 먼저 한다. 맞는 id면 기존 config와 deadline을 그대로 둔다.
+- **M6 복원 실패 메시지** — 모델 불일치 오류가 그 모델의 secret을 모으기 전에 원격 id가 든 핸들을 인용했다.
+  이제 복원 실패 메시지(모델 불일치, 핸들 형식 아님)는 모델 id만 말하고 원격 id는 인용하지 않는다.
+- **r3 M1 실패한 복원의 예산** — 복원이 실패해도 그 시도가 시작한 잡 deadline을 핸들별로 기억한다. 다시 복원하면
+  남은 시간만 쓰고, `deadline_for`도 그 deadline을 돌려주므로 `poll_until_done`이 두 번째 예산을 시작하지 않는다
+  (10초 잡의 resolver 예산 [10,10,2] → [10,2]). cancel은 자기 상한으로 조회하지만 잡 deadline은 바꾸지 않는다.
+- **r3 M2 기존 DB 제한 유지** — 설정값은 min(기존 값, 남은 예산)이다. Postgres 0(무제한)에는 예산을 적용한다.
+  SQLite `busy_timeout` 0(잠금을 기다리지 않음)은 어떤 예산보다 엄격하므로 그대로 둔다.

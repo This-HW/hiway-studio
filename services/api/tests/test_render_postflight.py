@@ -158,13 +158,13 @@ def _source_clip(env, *, real: bool) -> Path:
     return abs_path
 
 
-def _preset(*, burn: bool = False) -> uuid.UUID:
+def _preset(*, burn: bool = False, resolution: str = f"{_W}x{_H}") -> uuid.UUID:
     with session_scope() as db:
         preset = ExportPreset(
-            name="test 640x360",
+            name=f"test {resolution}",
             platform="custom",
             aspect_ratio="16:9",
-            resolution=f"{_W}x{_H}",
+            resolution=resolution,
             fps=_FPS,
             codec="h264",
             audio_codec="aac",
@@ -714,17 +714,25 @@ def test_cue_overlapping_output_end_is_verified(env, monkeypatch, font_size_px):
     assert tl.output_path == good
 
 
-def _dual_tracks(env, *, font_size_px: int) -> list[uuid.UUID]:
+def _dual_tracks(
+    env,
+    *,
+    font_size_px: int,
+    texts: tuple[str, str] = ("MISSING", "VISIBLE OTHER TRACK"),
+    times: tuple[tuple[float, float], tuple[float, float]] = ((0.5, 2.0), (0.5, 2.0)),
+) -> list[uuid.UUID]:
     """Track A (middle) and B (bottom), both with a 30% safe-area margin (the
     reviewer's P08 layout: the generous bands of A and B overlap)."""
     ids = []
     with session_scope() as db:
-        for text_, position in (("MISSING", "middle"), ("VISIBLE OTHER TRACK", "bottom")):
+        for text_, position, (start, end) in zip(
+            texts, ("middle", "bottom"), times, strict=True
+        ):
             track = subtitle_service.create_track(
                 db, env["project_id"], language_code="en"
             )
             subtitle_service.save_cues(
-                db, track.id, [{"start_sec": 0.5, "end_sec": 2.0, "text": text_}]
+                db, track.id, [{"start_sec": start, "end_sec": end, "text": text_}]
             )
             subtitle_service.save_style(
                 db,
@@ -796,6 +804,159 @@ def test_dual_track_presence_is_track_specific(env, monkeypatch, mode, broken):
     assert "burnin_presence (track 0)" in tl.error_message, tl.error_message
     assert "burnin_presence (track 1)" not in tl.error_message, tl.error_message
     assert tl.output_path is None
+
+
+def _require_ocr() -> None:
+    if ocr.AVAILABLE:
+        return
+    if os.environ.get("REQUIRE_MEDIA_TOOLS", "").strip().lower() in ("1", "true", "yes"):
+        pytest.fail("OCR engine not installed (REQUIRE_MEDIA_TOOLS=1)")
+    pytest.skip("OCR engine not installed")
+
+
+def _capture_postflight(monkeypatch) -> dict:
+    """Keep the postflight results of the last render (also when it fails)."""
+    real = render_service._postflight
+    seen: dict = {}
+
+    def _wrapped(*a, **k):
+        seen["results"], seen["problems"], seen["unverified"] = real(*a, **k)
+        return seen["results"], seen["problems"], seen["unverified"]
+
+    monkeypatch.setattr(render_service, "_postflight", _wrapped)
+    return seen
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.needs_cjk_font
+@pytest.mark.parametrize(
+    "texts",
+    [("MISSING", "VISIBLE OTHER TRACK"), ("SAME TEXT", "SAME TEXT")],
+    ids=["distinct", "same"],
+)
+@pytest.mark.parametrize("broken", [None, "transparent", "missing"])
+def test_dual_track_ocr_ignores_other_track(env, monkeypatch, texts, broken):
+    """B9: overlapping OCR bands (middle + 30%-margin bottom, 32px glyphs, OCR
+    engine present). A correct dual render is published — the other track's
+    glyphs no longer leak into a track's OCR text (false fail) — and a
+    transparent / missing track 0 still fails ITS OWN OCR check even when
+    track 1 shows the very same text (no false pass)."""
+    _require_ocr()
+    a, b = _dual_tracks(env, font_size_px=96, texts=texts)
+    tid = _timeline(env, real=True, track_ids=[a, b])
+    preset_id = _preset(burn=True)
+    if broken:
+        _break_section(monkeypatch, "S0", broken)
+    seen = _capture_postflight(monkeypatch)
+
+    _request(tid, preset_id)
+    result = _render(tid)
+    tl = _get(tid)
+    ocr_results = seen["results"]["burnin_ocr"]
+    statuses = [(r["track"], r["status"]) for r in ocr_results]
+    if broken is None:
+        assert result.successful(), tl.error_message
+        assert tl.status == "done", tl.error_message
+        assert statuses == [(0, "pass"), (1, "pass")], ocr_results
+        assert tl.render_meta["unverified"] == []
+        scrubbed = [m.get("scrubbed_px", 0) for r in ocr_results for m in r["measured"]]
+        assert all(px > 0 for px in scrubbed), ocr_results
+        return
+    assert result.failed()
+    assert tl.status == "failed" and tl.error_code == ErrorCode.QC_FAILED
+    assert tl.output_path is None
+    # Track 0's own OCR check fails (not only pixel presence); track 1 passes.
+    assert statuses == [(0, "fail"), (1, "pass")], ocr_results
+    assert not any("(track 1)" in p for p in seen["problems"]), seen["problems"]
+
+
+# --- B9b-r2: which cue is on screen = ASS centisecond times + real frame (B9-H1) ----
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.needs_cjk_font
+@pytest.mark.parametrize(
+    "resolution,font_size_px",
+    [("640x360", 240), ("1920x1080", 216)],
+    ids=["360p", "1080p"],
+)
+def test_dual_missing_track_at_other_cue_ass_boundary_is_not_published(
+    env, monkeypatch, resolution, font_size_px
+):
+    """B9-H1 (reviewer P07): A = middle [1.201, 1.301], B = bottom [1.252,
+    2.4], both "SAME TEXT". The midpoint of A (1.251s) is before B's raw
+    start, but B's ASS start is 1.25s and the extracted frame is a real frame
+    — B is on screen there. A missing / transparent A must not be proven
+    present by B's pixels or B's OCR text: the render fails, nothing is
+    published (the old raw-float decision published it). A TRANSPARENT A is
+    not this case: libass still lays the invisible event out and its
+    collision handling moves B away for B's whole lifetime."""
+    _require_ocr()
+    a, b = _dual_tracks(
+        env,
+        font_size_px=font_size_px,
+        texts=("SAME TEXT", "SAME TEXT"),
+        times=((1.201, 1.301), (1.252, 2.4)),
+    )
+    tid = _timeline(env, real=True, track_ids=[a, b])
+    preset_id = _preset(burn=True, resolution=resolution)
+    _break_section(monkeypatch, "S0", "missing")
+    seen = _capture_postflight(monkeypatch)
+
+    _request(tid, preset_id)
+    result = _render(tid)
+    tl = _get(tid)
+    assert result.failed(), seen.get("results")
+    assert tl.status == "failed" and tl.error_code == ErrorCode.QC_FAILED
+    assert tl.output_path is None
+    assert any("(track 0)" in p for p in seen["problems"]), seen["problems"]
+    assert not any("(track 1)" in p for p in seen["problems"]), seen["problems"]
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.needs_cjk_font
+@pytest.mark.parametrize("broken", [None, "missing"])
+def test_dual_other_cue_starting_near_midpoint_is_judged_by_ass_time(
+    env, monkeypatch, broken
+):
+    """B9-H1 (reviewer P08): A = "MISSING" [0.5, 2.002], B = "VISIBLE OTHER
+    TRACK" [1.252, 2.4], 32px. A's midpoint 1.251s sits on B's ASS start
+    (1.25s): the old raw comparison left B unscrubbed in a frame that shows
+    it, and a correct render false-failed. A is now sampled at least one
+    frame + 1cs away from B's boundaries: the correct render is published,
+    and a missing A still fails its own checks."""
+    _require_ocr()
+    a, b = _dual_tracks(
+        env,
+        font_size_px=96,
+        times=((0.5, 2.002), (1.252, 2.4)),
+    )
+    tid = _timeline(env, real=True, track_ids=[a, b])
+    preset_id = _preset(burn=True)
+    if broken:
+        _break_section(monkeypatch, "S0", broken)
+    seen = _capture_postflight(monkeypatch)
+
+    _request(tid, preset_id)
+    result = _render(tid)
+    tl = _get(tid)
+    if broken is None:
+        assert result.successful(), seen.get("problems")
+        assert tl.status == "done", tl.error_message
+        assert tl.output_path
+        ocr_results = seen["results"]["burnin_ocr"]
+        assert [(r["track"], r["status"]) for r in ocr_results] == [
+            (0, "pass"),
+            (1, "pass"),
+        ], ocr_results
+        presence = seen["results"]["burnin_presence"]
+        assert [p["status"] for p in presence] == ["pass", "pass"], presence
+        return
+    assert result.failed()
+    assert tl.status == "failed" and tl.error_code == ErrorCode.QC_FAILED
+    assert tl.output_path is None
+    assert any("(track 0)" in p for p in seen["problems"]), seen["problems"]
+    assert not any("(track 1)" in p for p in seen["problems"]), seen["problems"]
 
 
 def _probe_candidate(monkeypatch, behaviour) -> None:

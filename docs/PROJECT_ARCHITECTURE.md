@@ -45,7 +45,7 @@ ai-studio/
 ├── .github/workflows/ci.yml    # CI: api(pytest SQLite+Postgres·ruff·lint-imports·contracts·compose loopback) / web / image
 ├── tools/                      # lint_imports.py, demo.py, check_compose_loopback.py, verify_cjk_burnin.py 등
 ├── apps/
-│   └── web/                    # Next.js 14 App Router + TS + Zustand + TanStack Query
+│   └── web/                    # Next.js 15 App Router + TS + Zustand + TanStack Query
 │       ├── app/                # 라우트 (아래 §5)
 │       ├── components/         # 여러 화면에서 쓰는 것만 (버튼·모달·잡 뱃지 등)
 │       ├── lib/                # api-client.ts, sse.ts, query-keys.ts (API 호출은 여기로만)

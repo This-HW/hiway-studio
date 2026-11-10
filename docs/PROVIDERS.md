@@ -55,12 +55,18 @@ frames text-only; the snapshot records `references_applied: false` and a
 every response (JSON and error bodies included) is streamed with the
 deadline re-checked per chunk and, on the real transport, per socket read
 and per partial send — a provider dripping bytes, or reading a large
-request body slowly, cannot stretch a call past it. Known gaps (ADR-0014,
-review B7R3): DNS resolution is not bounded; a host with several addresses
-gets the remaining time once per connect attempt, so failing connects can
-add up past the deadline; TLS-in-TLS proxies may overshoot by one 16 KiB
+request body slowly, cannot stretch a call past it. DNS resolution and the
+connect are bounded too (ADR-0014 B9): the lookup gets only the time left
+(a resolver that hangs past it keeps its daemon thread until it returns;
+at most `HTTP_DNS_MAX_RESOLVER_THREADS` resolver threads run per process,
+and waiting for a free slot counts against the same deadline — none free
+in time is the deadline error), then the resolved addresses are tried one
+by one, each with the time left recomputed, so several unreachable
+addresses cannot add up past the deadline. Each attempt uses the resolved
+family and full sockaddr, so a link-local IPv6 address keeps its scope id
+(the same IP on two interfaces is two attempts). Known gaps: TLS-in-TLS proxies may overshoot by one 16 KiB
 chunk; the socket bounds rely on httpx/httpcore internals (regressions are
-caught by the slow-drip / slow-reader tests). Cancel
+caught by the slow-drip / slow-reader / connect tests). Cancel
 has its own short cap (`HTTP_CANCEL_TIMEOUT_SEC`). On the deadline the
 adapter calls `cancel` (best effort) and the job fails as
 `PROVIDER_UNCERTAIN` (never auto-resubmitted). JSON responses are capped at
@@ -74,7 +80,14 @@ frame (Pillow; multi-frame GIF/APNG/WebP are rejected; the image worker
 re-checks every adapter's result before publishing). Requests send
 `Accept-Encoding: identity`; a compressed response is refused (its
 decompression could not be bounded). Redirects are followed by the adapter
-itself, at most 5 hops, each redirect body closed unread. Every provider
+itself, at most 5 hops, each redirect body closed unread; once a hop leaves
+the original origin (scheme, host or port), no header VALUE from the
+seed's `headers` blocks is sent again, even on a hop back to the origin:
+`Authorization`, `X-API-Key`, ... are dropped, and a seed-set
+`Content-Type`/`Content-Length`/`Transfer-Encoding` is replaced by the value
+derived from the body itself (or dropped when the hop re-sends no body,
+e.g. 303 → GET). A multipart body framed by a seed `Content-Type` is never
+re-sent to another origin (`redirect_reframe_refused`). Every provider
 text or metadata value quoted in a message (error snippets, a `200` body's
 `error_path` value, state values, provider job ids, CLI stderr) is
 secret-redacted BEFORE it is length-capped. All values live in
@@ -85,7 +98,21 @@ secret-redacted BEFORE it is length-capped. All values live in
 `provider_job_id`; status/result/cancel URLs still receive the provider's
 own id as `{job_id}`. Two endpoints that hand out the same remote id never
 share state, and a later process can poll/fetch/cancel a persisted handle
-(the config is rebuilt from the registry). Rows persisted before this change
+(`HttpPollingAdapter.restore(handle, model=None)`, also implicit on
+poll/fetch/cancel). The restored config is the one the worker executes: the
+entry passed as `model`, else the pinned entry, else the DB row read in its
+own session — the seed only when the model has no DB row, and an unreadable
+DB is `MODEL_UNAVAILABLE`, never a seed fallback. A restored handle starts
+ONE new total deadline (`HTTP_JOB_TOTAL_DEADLINE_SEC` from the restore
+ENTRY, so the registry read counts against it; the original deadline is
+not recovered) that polling and the result fetch share; cancel's cap also
+starts before any restore. The DB read gets the time left as its bound:
+Postgres `SET LOCAL statement_timeout`/`lock_timeout`, SQLite
+`busy_timeout` for that session. Not bounded: waiting for a pooled
+connection (`pool_timeout`) and opening a new one (ADR-0014 B9a-r2). An
+explicit `model` must name the handle's model even when the handle is
+already tracked, and a restore failure names model ids only, never the
+remote id. Nothing in the worker or reconcile restores handles today. Rows persisted before this change
 hold the bare remote id and stay unknown to a fresh process, as before.
 
 ## 2. Adding a new provider (procedure)

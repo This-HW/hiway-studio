@@ -143,11 +143,21 @@ body of any of them — is streamed (B7-r2 H2): the deadline is re-checked
 per received chunk and, on the real transport, every socket read and every
 partial send is clamped to the time left (B7-r3 H1), so a provider that
 drips bytes or reads a large request slowly cannot stretch one call past
-the deadline. Redirects are followed here (<= 5 hops, redirect bodies never
-read) and only identity-encoded bodies are accepted (B7-r3 M2). ``submit``
+the deadline. DNS resolution and each connect attempt (one per resolved
+address, full sockaddr incl. IPv6 scope) get only the time left too (B9 M4,
+B9a-r2 M3); at most ``HTTP_DNS_MAX_RESOLVER_THREADS`` resolver threads run
+per process (B9a-r2 M2). Redirects are followed here (<= 5 hops, redirect
+bodies never read; after a cross-origin hop no header value from the seed
+config is sent: auth-like headers are dropped, framing headers re-derived
+from the body, B9 M5 / B9a-r2 M1) and only identity-encoded bodies are
+accepted (B7-r3 M2). ``submit``
 returns a local job handle (``job_handle``: remote id + model id + nonce,
-B7-r3 M5); ``{job_id}`` in URL templates is still the provider's id. Cancel has its own short absolute cap
-(``HTTP_CANCEL_TIMEOUT_SEC``). Each body has a byte cap: JSON responses
+B7-r3 M5); ``{job_id}`` in URL templates is still the provider's id. A
+persisted handle is restored in another process (``restore``) with the
+registry entry the worker would execute and ONE new total deadline (B9
+M2/M3), started BEFORE the registry read (B9a-r2 M4). Cancel has its own
+short absolute cap (``HTTP_CANCEL_TIMEOUT_SEC``), also started before any
+restore. Each body has a byte cap: JSON responses
 ``HTTP_JSON_MAX_BYTES`` (+ the base64 size of the media cap when the
 response carries inline output bytes), error bodies a short snippet, and the
 result download a per-media cap (``HTTP_RESULT_MAX_BYTES_*``) — a lying or
@@ -182,6 +192,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import ipaddress
 import json
 import logging
 import math
@@ -326,17 +337,176 @@ class _DeadlineStream(httpcore.NetworkStream):
         return self._inner.get_extra_info(info)
 
 
+# Resolver threads still running in this process (B9a-r2 M2). A slot is
+# held from thread start until getaddrinfo RETURNS, also after its caller
+# gave up at the deadline; the cap is ``defaults.HTTP_DNS_MAX_RESOLVER_THREADS``.
+_dns_slots = threading.Condition()
+_dns_active = 0
+
+
+def _dns_acquire(wait: float | None) -> None:
+    """Take one resolver slot, waiting at most ``wait`` seconds (the time
+    left before the call deadline); none free in time -> ConnectTimeout."""
+    global _dns_active
+    with _dns_slots:
+        if not _dns_slots.wait_for(
+            lambda: _dns_active < defaults.HTTP_DNS_MAX_RESOLVER_THREADS, wait
+        ):
+            raise httpcore.ConnectTimeout(
+                "provider call deadline reached (waiting for a DNS resolver slot)"
+            )
+        _dns_active += 1
+
+
+def _dns_release() -> None:
+    global _dns_active
+    with _dns_slots:
+        _dns_active -= 1
+        _dns_slots.notify_all()
+
+
+def _resolve_bounded(
+    host: str, port: int, timeout: float | None
+) -> list[tuple[int, int, int, tuple]]:
+    """``(family, type, proto, sockaddr)`` of ``host``, resolved within the
+    time left (B9 M4).
+
+    ``getaddrinfo`` has no timeout of its own: it runs on a daemon thread and
+    the caller waits at most the time left before the call deadline. At most
+    ``HTTP_DNS_MAX_RESOLVER_THREADS`` such threads exist per process: a
+    resolver hanging past its caller's deadline keeps its slot until it
+    returns, and waiting for a free slot counts against the same deadline
+    (B9a-r2 M2). The full sockaddr is kept (IPv6 flow info and scope id;
+    duplicates are dropped per family + sockaddr, so the same link-local
+    address on two interfaces stays two addresses; B9a-r2 M3). IP literals
+    are converted without a lookup (numeric only, cannot block).
+    """
+    try:
+        ipaddress.ip_address(host)
+        literal = True
+    except ValueError:
+        literal = False
+    if literal:
+        try:
+            infos = socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+            )
+        except OSError as exc:
+            raise httpcore.ConnectError(f"invalid address: {exc}") from exc
+    else:
+        _dns_acquire(_clamped(timeout, httpcore.ConnectTimeout))
+        try:
+            # The wait for a slot came out of the same budget.
+            wait = _clamped(timeout, httpcore.ConnectTimeout)
+            box: dict = {}
+            done = threading.Event()
+
+            def _run() -> None:
+                try:
+                    box["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                except Exception as exc:  # noqa: BLE001 (reported by the caller below)
+                    box["error"] = exc
+                finally:
+                    _dns_release()  # the slot is held until the resolver returns
+                    done.set()
+
+            threading.Thread(target=_run, name="http-polling-dns", daemon=True).start()
+        except BaseException:
+            _dns_release()  # no thread took the slot over
+            raise
+        if not done.wait(wait):
+            raise httpcore.ConnectTimeout("provider call deadline reached (DNS resolution)")
+        error = box.get("error")
+        if error is not None:
+            raise httpcore.ConnectError(f"DNS resolution failed: {error}") from error
+        infos = box["infos"]
+    addresses: list[tuple[int, int, int, tuple]] = []
+    seen: set[tuple[int, tuple]] = set()
+    for family, socktype, proto, _canon, sockaddr in infos:
+        key = (family, tuple(sockaddr))
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append((family, socktype, proto, tuple(sockaddr)))
+    if not addresses:
+        raise httpcore.ConnectError("DNS resolution returned no address")
+    return addresses
+
+
 class _DeadlineBackend(httpcore.NetworkBackend):
     def __init__(self, inner: httpcore.NetworkBackend) -> None:
         self._inner = inner
 
     def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
-        return _DeadlineStream(
-            self._inner.connect_tcp(
-                host, port, _clamped(timeout, httpcore.ConnectTimeout),
-                local_address, socket_options,
+        """Connect under the call deadline (B9 M4).
+
+        The stdlib ``socket.create_connection`` re-applies ONE timeout to
+        every resolved address, so a host with N unreachable addresses took
+        N x the time left, and its DNS lookup was unbounded. Here DNS is
+        bounded by the time left, then each address is tried in turn with
+        the time left recomputed before each attempt; once it is used up the
+        connect fails with ConnectTimeout (-> the adapter's deadline error).
+        The cancel cap runs through the same path.
+        """
+        if getattr(_call_deadline, "value", None) is None:
+            return _DeadlineStream(
+                self._inner.connect_tcp(host, port, timeout, local_address, socket_options)
             )
-        )
+        last: Exception | None = None
+        for family, socktype, proto, sockaddr in _resolve_bounded(host, port, timeout):
+            attempt = _clamped(timeout, httpcore.ConnectTimeout)
+            try:
+                stream = self._connect_one(
+                    family, socktype, proto, sockaddr, attempt, local_address,
+                    socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last = exc
+                continue
+            return _DeadlineStream(stream)
+        _clamped(timeout, httpcore.ConnectTimeout)  # deadline used up -> ConnectTimeout
+        if last is not None:
+            raise last
+        raise httpcore.ConnectError("no address to connect to")
+
+    def _connect_one(
+        self, family, socktype, proto, sockaddr, timeout, local_address, socket_options
+    ):
+        """One attempt at exactly ``sockaddr`` (B9a-r2 M3).
+
+        The stdlib/httpcore path takes a host STRING and resolves it again,
+        which loses the family and an IPv6 scope id (``fe80::1%7`` would go
+        out on scope 0). On httpcore's sync backend the socket is opened
+        here from the resolved tuple, mirroring ``SyncBackend.connect_tcp``
+        (same options, TCP_NODELAY, same exception mapping). Another backend
+        gets the numeric host with ``%scope`` appended for a scoped address.
+        """
+        if _SyncStream is None or not isinstance(self._inner, httpcore.SyncBackend):
+            host = str(sockaddr[0])
+            if family == socket.AF_INET6 and len(sockaddr) >= 4 and sockaddr[3]:
+                host = f"{host}%{sockaddr[3]}"
+            return self._inner.connect_tcp(
+                host, sockaddr[1], timeout, local_address, socket_options
+            )
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            if local_address is not None:
+                sock.bind((local_address, 0))
+            sock.connect(sockaddr)
+            for option in socket_options or ():
+                sock.setsockopt(*option)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except socket.timeout as exc:
+            if sock is not None:
+                sock.close()
+            raise httpcore.ConnectTimeout(str(exc)) from exc
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            raise httpcore.ConnectError(str(exc)) from exc
+        return _SyncStream(sock)
 
     def connect_unix_socket(self, path, timeout=None, socket_options=None):
         return _DeadlineStream(
@@ -580,6 +750,25 @@ def _origin(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# Request framing/representation headers httpx manages on a redirect hop:
+# not dropped with the configured headers, but a VALUE the seed supplied for
+# one of them never crosses origins either (B9a-r2 M1; an env: value such
+# as "application/json; api_key=..." is still a secret). httpx resets Host
+# on a cross-origin hop and Accept-Encoding is always our own "identity";
+# the rest (_REDIRECT_REFRAME_HEADERS) is re-derived from the body.
+_REDIRECT_KEEP_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "content-type", "accept-encoding"}
+)
+_REDIRECT_REFRAME_HEADERS = frozenset({"content-length", "transfer-encoding", "content-type"})
+
+
+def _origin_key(url: httpx.URL) -> tuple[str, str, int | None]:
+    """(scheme, host, port) with the scheme's default port filled in."""
+    scheme = url.scheme.lower()
+    return scheme, (url.host or "").lower(), url.port or _DEFAULT_PORTS.get(scheme)
+
+
 def _decode_inline_bytes(value: str, *, max_bytes: int | None = None, what: str = "") -> bytes:
     """Decode base64 output bytes, tolerating a ``data:...;base64,`` prefix.
 
@@ -668,11 +857,12 @@ class HttpPollingAdapter(ProviderAdapter):
                 _install_deadline_backend(self._client)
         return self._client
 
-    def _http_config(self, model_id: str) -> dict:
-        # Deferred import: registry imports this module at load time.
-        from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
+    def _http_config(self, model_id: str, model: dict | None = None) -> dict:
+        if model is None:
+            # Deferred import: registry imports this module at load time.
+            from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
 
-        model = registry.get_model(model_id)  # raises NOT_FOUND when unknown
+            model = registry.get_model(model_id)  # raises NOT_FOUND when unknown
         http = (model.get("capabilities") or {}).get("http")
         if not isinstance(http, dict) or not http:
             raise StudioError(
@@ -704,8 +894,23 @@ class HttpPollingAdapter(ProviderAdapter):
             self._remote.pop(oldest, None)
 
     def deadline_for(self, provider_job_id: str) -> float | None:
-        """Monotonic deadline of a submitted job (poll_until_done uses it)."""
-        return self._deadlines.get(provider_job_id)
+        """Monotonic deadline of a submitted job (poll_until_done uses it).
+
+        A persisted handle unknown to this process is restored first (B9
+        M2), so the deadline poll_until_done reads is the one the HTTP calls
+        enforce. A FAILED restore still returns the deadline it started
+        (B9a-r3 M1): poll_until_done never starts a second job budget, and
+        poll's re-restore only gets what is left of it. None only when the
+        id is not a handle at all (poll then raises).
+        """
+        deadline = self._deadlines.get(provider_job_id)
+        if deadline is None and provider_job_id not in self._jobs:
+            try:
+                self._restore(provider_job_id, None)
+            except Exception:  # noqa: BLE001 (poll reports the same failure)
+                pass
+            deadline = self._deadlines.get(provider_job_id)
+        return deadline
 
     def _secrets(self) -> list[str]:
         return [os.environ[n] for n in self._secret_names if os.environ.get(n)]
@@ -755,23 +960,86 @@ class HttpPollingAdapter(ProviderAdapter):
         return min(configured, remaining)
 
     def _lookup(self, provider_job_id: str) -> tuple[str, dict]:
+        return self._restore(provider_job_id, None)
+
+    def restore(self, provider_job_id: str, model: dict | None = None) -> None:
+        """Rebuild the in-flight state of a persisted handle in THIS process
+        (restart / reconcile; B9 M2/M3). poll/fetch_result/cancel/deadline_for
+        call it implicitly with ``model=None``.
+
+        Config: ``model`` is the registry entry the caller resolved (e.g.
+        ``registry.get_model(model_id, db)``, the worker's DB overlay); its
+        ``model_id`` must match the handle. Without it the entry comes from
+        ``registry.resolve_model``: the pinned entry (``pinned_model``), else
+        the DB overlay read in its own session — the seed only when the model
+        has no DB row, and a DB failure is an error, never a seed fallback.
+
+        Deadline: a restored handle starts ONE new total deadline
+        (``HTTP_JOB_TOTAL_DEADLINE_SEC`` from the restore ENTRY, so the
+        registry/DB read counts against it; the original one is not
+        recoverable), stored on the adapter and shared by polling and the
+        result fetch. The DB read gets the time left as its bound
+        (``registry.resolve_model(timeout=...)``; B9a-r2 M4). A handle this
+        adapter already tracks keeps its state, but an explicit ``model``
+        must still name the handle's model (B9a-r2 M5). A failure message
+        names model ids only, never the provider's remote id (B9a-r2 M6).
+        """
+        try:
+            self._restore(provider_job_id, model)
+        except StudioError as exc:
+            raise self._sanitized(exc)
+
+    def _restore(
+        self, provider_job_id: str, model: dict | None, *, budget: float | None = None
+    ) -> tuple[str, dict]:
+        """See ``restore``. ``budget``: an absolute monotonic bound of the
+        registry read used INSTEAD of the job deadline (cancel's own cap);
+        it never changes the job deadline."""
+        # Started at ENTRY: the registry/DB read counts against it (B9a-r2 M4).
+        # A handle whose earlier restore failed keeps the deadline that
+        # attempt started: one job budget per handle, never restarted
+        # (B9a-r3 M1).
+        deadline = self._deadlines.get(provider_job_id)
+        if deadline is None:
+            deadline = _monotonic() + defaults.HTTP_JOB_TOTAL_DEADLINE_SEC
         entry = self._jobs.get(provider_job_id)
+        parsed = parse_job_handle(provider_job_id)
+        if model is not None:
+            # Checked before the cache hit (B9a-r2 M5). Model ids only: the
+            # secrets of this model are not collected yet, so a reflected
+            # remote id is never quoted here (B9a-r2 M6).
+            expected = entry[0] if entry is not None else (parsed[1] if parsed else None)
+            if expected is not None and model.get("model_id") != expected:
+                raise StudioError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"Cannot restore a provider job of model "
+                    f"{str(expected)[:_ID_QUOTE_CHARS]!r} with the registry entry of "
+                    f"model {str(model.get('model_id'))[:_ID_QUOTE_CHARS]!r}.",
+                )
         if entry is not None:
             return entry
-        parsed = parse_job_handle(provider_job_id)
         if parsed is None:
+            # No model -> no secrets to redact with: the id is not quoted (M6).
             raise StudioError(
                 ErrorCode.MODEL_UNAVAILABLE,
-                f"Unknown provider job id {self._ref(provider_job_id)!r}; it was not "
-                "submitted through this adapter instance.",
+                "Unknown provider job id (not a '<remote id>@<model id>#<nonce>' "
+                "handle); it was not submitted through this adapter instance.",
             )
-        # A handle from another process (restart / reconcile): rebuild the
-        # in-flight entry from the registry. No deadline is known here;
-        # poll_until_done then starts a fresh one.
         remote, model_id = parsed
-        cfg = self._http_config(model_id)
+        if model is None:
+            from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
+
+            # Remembered BEFORE the read: if it fails, the next attempt
+            # (poll after deadline_for) only gets the time left (B9a-r3 M1).
+            self._deadlines.setdefault(provider_job_id, deadline)
+            while len(self._deadlines) > _MAX_REMEMBERED_JOBS:
+                self._deadlines.pop(next(iter(self._deadlines)))
+            bound = deadline if budget is None else budget
+            model = registry.resolve_model(model_id, timeout=bound - _monotonic())
+        cfg = self._http_config(model_id, model)
         self._remember(model_id, cfg, provider_job_id, remote)
-        self._modality[provider_job_id] = self._modality_of(model_id)
+        self._modality[provider_job_id] = str(model.get("modality") or "image")
+        self._deadlines[provider_job_id] = deadline
         return model_id, cfg
 
     def _ctx(self, model_id: str, provider_job_id: str, cfg: dict, payload: dict) -> dict:
@@ -857,14 +1125,38 @@ class HttpPollingAdapter(ProviderAdapter):
                     files=files,
                     timeout=timeout,
                 )
+                # Header values from the seed config (auth or otherwise)
+                # never leave the original origin (B9 M5, B9a-r2 M1).
+                configured = {str(k).lower() for k in (headers or {})}
+                seed_framing = configured & _REDIRECT_REFRAME_HEADERS
+                configured -= _REDIRECT_KEEP_HEADERS
+                origin = _origin_key(request.url)
+                crossed = False
+                body_resent = True
                 for _hop in range(_MAX_REDIRECTS + 1):
                     resp = client.send(request, stream=True, follow_redirects=False)
                     try:
                         if resp.next_request is not None:
                             # Redirect: its body is closed UNREAD (B7-r3 M2);
                             # httpx builds the next request (method change,
-                            # cross-origin Authorization stripped).
-                            request = resp.next_request
+                            # cross-origin Authorization stripped). Once a hop
+                            # leaves the origin (scheme, host or port), every
+                            # configured header is dropped for the rest of
+                            # the chain, also on a hop back to the origin, and
+                            # a seed-set framing header is re-derived.
+                            previous, request = request, resp.next_request
+                            if request.method != previous.method and request.method == "GET":
+                                body_resent = False  # httpx drops the body here
+                            crossed = crossed or _origin_key(request.url) != origin
+                            if crossed:
+                                for name in configured:
+                                    request.headers.pop(name, None)
+                                if seed_framing:
+                                    self._reframe(
+                                        request, seed_framing, body_resent=body_resent,
+                                        json_body=json_body, data=data, files=files,
+                                        what=what,
+                                    )
                             if deadline is not None and _monotonic() >= deadline:
                                 raise _deadline_error(self._ref(job))
                             continue
@@ -891,6 +1183,40 @@ class HttpPollingAdapter(ProviderAdapter):
                     limit=_MESSAGE_MAX_CHARS,
                 ),
             ) from e
+
+    @staticmethod
+    def _reframe(
+        request: httpx.Request, names: set[str], *, body_resent: bool,
+        json_body, data, files, what: str,
+    ) -> None:
+        """Replace seed-supplied framing headers on a cross-origin hop
+        (B9a-r2 M1).
+
+        The seed's value is never forwarded: each header gets the value httpx
+        derives from the body itself (JSON / form / empty body), or is
+        dropped when the hop re-sends no body (e.g. 303 -> GET). A multipart
+        body cannot be re-derived (its boundary came from the seed's
+        Content-Type), so re-sending it to another origin is refused.
+        """
+        if body_resent and files:
+            raise StudioError(
+                ErrorCode.PROVIDER_ERROR,
+                f"{what}: a redirect to another origin would re-send a multipart "
+                "body framed by the seed's own header(s) "
+                f"({', '.join(sorted(names))}); refused (seed header values never "
+                "leave the original origin).",
+                details={"reason": "redirect_reframe_refused"},
+            )
+        derived = (
+            httpx.Request(request.method, request.url, json=json_body, data=data).headers
+            if body_resent
+            else httpx.Headers()
+        )
+        for name in names:
+            request.headers.pop(name, None)
+            value = derived.get(name)
+            if value is not None:
+                request.headers[name] = value
 
     def _receive(
         self, resp: httpx.Response, *, what: str, deadline: float | None, job: str,
@@ -1406,8 +1732,12 @@ class HttpPollingAdapter(ProviderAdapter):
         return status
 
     def cancel(self, provider_job_id: str) -> None:
+        # Not capped by the job deadline (cancel runs after it passed): its
+        # own short absolute cap (B7-r2 H2), started at ENTRY so restoring a
+        # handle (registry/DB read) counts against it too (B9a-r2 M4).
+        cap = _monotonic() + defaults.HTTP_CANCEL_TIMEOUT_SEC
         try:
-            model_id, cfg = self._lookup(provider_job_id)
+            model_id, cfg = self._restore(provider_job_id, None, budget=cap)
         except Exception:  # noqa: BLE001 (unknown job: best-effort no-op)
             return None
         cancel_cfg = cfg.get("cancel")
@@ -1419,15 +1749,13 @@ class HttpPollingAdapter(ProviderAdapter):
             url = _render(cancel_cfg.get("url_template"), ctx, model_id=model_id)
             headers = _resolve_env(cancel_cfg.get("headers") or {}, model_id=model_id)
             method = str(cancel_cfg.get("method", "POST")).upper()
-            # Not capped by the job deadline (cancel runs after it passed):
-            # its own short absolute cap instead (B7-r2 H2).
             self._call(
                 method,
                 str(url),
                 headers=headers,
                 timeout=defaults.HTTP_CANCEL_TIMEOUT_SEC,
                 what=f"Cancel provider job {self._ref(provider_job_id)}",
-                deadline=_monotonic() + defaults.HTTP_CANCEL_TIMEOUT_SEC,
+                deadline=cap,
                 job=provider_job_id,
                 max_bytes=_ERROR_BODY_READ_BYTES,
             )
@@ -1610,7 +1938,8 @@ def poll_until_done(
     """Shared polling loop with exponential backoff (2s -> 10s max).
 
     Bounded by a monotonic total deadline (ADR-0014): the adapter's own job
-    deadline when it tracks one (http_polling starts it at submit), else
+    deadline when it tracks one (http_polling starts it at submit, or at
+    restore for a persisted handle — B9 M2), else
     ``HTTP_JOB_TOTAL_DEADLINE_SEC`` from now. Sleeps never overshoot it. On
     the deadline, a poll error or the iteration cap the provider job is
     canceled best-effort and a StudioError is raised (after submit the

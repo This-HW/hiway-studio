@@ -20,7 +20,8 @@ the output duration; unknown/zero duration -> not published). Cues are
 clipped to the part of the output that shows them. Every burned-in track
 must change the pixels of ITS OWN glyph footprint against the reference
 (track-specific pixel presence, any glyph size) and, when glyphs are large
-enough for OCR, `postflight_burnin` must pass. OCR engine missing / glyphs
+enough for OCR, `postflight_burnin` must pass (with the other tracks' glyph
+footprints replaced by reference pixels first, B9). OCR engine missing / glyphs
 too small / symbol-only cues (no letters or digits to OCR) -> published,
 recorded as `unverified` in `render_meta`. Any other non-pass -> not
 published.
@@ -625,6 +626,10 @@ def _frame(video: Path, at_sec: float, dst: Path) -> Image.Image:
         return img.convert("L")
 
 
+def _frame_sec(fps: float | None) -> float:
+    return 1.0 / fps if fps and fps > 0 else 1.0 / float(defaults.OUTPUT_FPS)
+
+
 def _visible_cues(cues: list, duration: float, fps: float) -> tuple[list, int]:
     """Cues clipped to the part of the output that shows them (B4B-H1).
 
@@ -632,15 +637,17 @@ def _visible_cues(cues: list, duration: float, fps: float) -> tuple[list, int]:
     there). A cue is checked when it intersects that window for at least one
     frame interval; its range is CLIPPED to the intersection so presence and
     OCR both sample inside what the output really shows (a cue [0.1, 6] on a
-    2.5s output is checked on [0.1, ~2.46]). Returns (clipped cues, number
-    of cues not visible: after the end, or shown for less than one frame)."""
-    frame = 1.0 / fps if fps and fps > 0 else 1.0 / float(defaults.OUTPUT_FPS)
+    2.5s output is checked on [0.1, ~2.46]). Cue times are first quantized
+    like the written ASS (`subtitle_render.ass_time`, B9-H1). Returns
+    (clipped cues, number of cues not visible: after the end, or shown for
+    less than one frame)."""
+    frame = _frame_sec(fps)
     last = duration - frame
     visible: list = []
     skipped = 0
     for cue in cues:
-        start = max(0.0, float(cue.start_sec))
-        end = min(float(cue.end_sec), last)
+        start = max(0.0, subtitle_render.ass_time(cue.start_sec))
+        end = min(subtitle_render.ass_time(cue.end_sec), last)
         if end - start < frame:
             skipped += 1
             continue
@@ -737,6 +744,120 @@ def _glyph_mask(
     return mask
 
 
+# --- sample timing (B9-H1) ---------------------------------------------------------
+# The burn-in shows a cue on [ass_time(start), ass_time(end)) and the frame
+# ffmpeg extracts for a requested time t is a real frame whose PTS can be up to
+# one frame away from t. So "which cue is on screen in the sampled frame" is
+# only certain when every cue boundary is at least one frame + one ASS
+# centisecond (the guard) away from t. Each cue is sampled at such a time when
+# its own shown range has one; otherwise a foreign cue whose boundary is
+# within the guard counts as SHOWN, so its pixels are excluded from presence
+# and scrubbed before OCR (never counted as this track's evidence). The
+# presence check and the OCR scrub use the same time and the same rule.
+
+
+def _sample_guard(fps: float | None) -> float:
+    return _frame_sec(fps) + subtitle_render.ASS_TIME_QUANTUM_SEC
+
+
+def _maybe_shown(cue, at_sec: float, guard: float) -> bool:
+    """True unless `cue` is certainly NOT on screen in the frame sampled at
+    `at_sec`: its ASS range [start, end) meets (at_sec - guard, at_sec + guard)."""
+    start = subtitle_render.ass_time(cue.start_sec)
+    end = subtitle_render.ass_time(cue.end_sec)
+    return start < at_sec + guard and end > at_sec - guard
+
+
+def _boundaries(others: list[tuple[list, dict]] | tuple) -> list[float]:
+    """Sorted ASS start/end times of every other track's cue with text."""
+    found: set[float] = set()
+    for other_cues, _ in others:
+        for other in other_cues:
+            if (other.text or "").strip():
+                found.add(subtitle_render.ass_time(other.start_sec))
+                found.add(subtitle_render.ass_time(other.end_sec))
+    return sorted(found)
+
+
+def _sample_time(cue, others: list[tuple[list, dict]] | tuple, guard: float) -> float:
+    """Sample time of a (quantized, clipped) cue of this track.
+
+    Candidates lie at least `guard` inside the cue's own range (its midpoint
+    when the cue is shorter than two guards). Preferred: the midpoint, when
+    it is `guard` away from every other track's cue boundary; else the
+    middle of the nearest sub-range that is; else (no such time) the
+    candidate farthest from any boundary — the boundaries still within the
+    guard then make their cues count as shown (`_maybe_shown`)."""
+    start, end = float(cue.start_sec), float(cue.end_sec)
+    mid = (start + end) / 2
+    lo, hi = start + guard, end - guard
+    if lo > hi:
+        lo = hi = mid
+    bounds = [b for b in _boundaries(others) if lo - guard < b < hi + guard]
+    safe: list[tuple[float, float]] = []
+    cur = lo
+    for b in bounds:
+        if b - guard >= cur:
+            safe.append((cur, min(b - guard, hi)))
+        cur = max(cur, b + guard)
+        if cur > hi:
+            break
+    if cur <= hi:
+        safe.append((cur, hi))
+    safe = [(a, z) for a, z in safe if a <= z]
+    if any(a <= mid <= z for a, z in safe):
+        return mid
+    if safe:
+        a, z = min(safe, key=lambda s: (min(abs(mid - s[0]), abs(mid - s[1])), s[0]))
+        return (a + z) / 2
+    candidates = [lo, hi] + [
+        (x + y) / 2 for x, y in zip(bounds, bounds[1:]) if lo <= (x + y) / 2 <= hi
+    ]
+
+    def _clearance(t: float) -> float:
+        return min(abs(t - b) for b in bounds)
+
+    return max(candidates, key=lambda t: (_clearance(t), -abs(t - mid)))
+
+
+def _cue_sample(cue, others, guard: float) -> float:
+    at = getattr(cue, "sample_sec", None)
+    return float(at) if at is not None else _sample_time(cue, others, guard)
+
+
+def _foreign_footprint(
+    others: list[tuple[list, dict]] | tuple,
+    at_sec: float,
+    size: tuple[int, int],
+    work: Path,
+    cache: _MaskCache,
+    dilate: int,
+    guard: float,
+) -> Image.Image:
+    """Union of the glyph footprints of every OTHER track's cue that may be
+    shown in the frame sampled at `at_sec` (`_maybe_shown`), each dilated by
+    a `dilate` x `dilate` max filter (odd)."""
+    foreign = Image.new("L", size, 0)
+    for other_cues, other_style in others:
+        for other in other_cues:
+            if not (other.text or "").strip():
+                continue
+            if _maybe_shown(other, at_sec, guard):
+                foreign = ImageChops.lighter(
+                    foreign,
+                    _glyph_mask(other.text, other_style, size, work, cache).filter(
+                        ImageFilter.MaxFilter(dilate)
+                    ),
+                )
+    return foreign
+
+
+# OCR scrub of another track's glyphs (B9): wider than the presence check's
+# 2px so anti-aliased edges and encoder ringing of the other track's outline
+# leave nothing OCR can read as a character.
+OCR_FOREIGN_DILATE: int = 9  # 4px
+
+
 def burnin_presence(
     output: Path,
     reference: Path,
@@ -745,14 +866,17 @@ def burnin_presence(
     *,
     others: list[tuple[list, dict]] | tuple = (),
     mask_cache: _MaskCache | None = None,
+    fps: float | None = None,
 ) -> dict[str, Any]:
     """Every cue of THIS track must change the pixels of its own glyphs.
 
-    Track-specific evidence (B4B-H2): at the midpoint of each (clipped) cue
-    the cue is drawn alone in this track's style on a blank canvas of the
+    Track-specific evidence (B4B-H2): at the sample time of each (clipped)
+    cue (`sample_sec` when set, else `_sample_time`: away from the other
+    tracks' ASS cue boundaries, B9-H1) the cue is drawn alone in this track's style on a blank canvas of the
     output size (`subtitle_render.render_glyph_mask`) — its glyph + outline
-    footprint, dilated 1px. Every pixel another track's cue active at that
-    time would draw (`others`, dilated 2px) is removed, so another track's
+    footprint, dilated 1px. Every pixel another track's cue that may be shown
+    in that frame would draw (`others`, `_maybe_shown`, dilated 2px) is
+    removed, so another track's
     subtitle can never prove this one present. Inside what remains, pixels
     whose luma differs from the subtitle-free reference by more than
     RENDER_BURNIN_PIXEL_DELTA must number at least
@@ -773,12 +897,13 @@ def burnin_presence(
     minimum = defaults.RENDER_BURNIN_MIN_CHANGED_PX
     fraction = defaults.RENDER_BURNIN_MASK_MIN_FRACTION
     delta = defaults.RENDER_BURNIN_PIXEL_DELTA
+    guard = _sample_guard(fps)
     measured: list[dict[str, Any]] = []
     problems: list[str] = []
     with tempfile.TemporaryDirectory(prefix="render_presence_") as d:
         work = Path(d)
         for i, cue in enumerate(targets):
-            mid = (float(cue.start_sec) + float(cue.end_sec)) / 2
+            mid = _cue_sample(cue, others, guard)
             entry: dict[str, Any] = {"cue": i, "at_sec": round(mid, 2)}
             measured.append(entry)
             try:
@@ -788,18 +913,7 @@ def burnin_presence(
                 own = _glyph_mask(cue.text, style, size, work, cache).filter(
                     ImageFilter.MaxFilter(3)
                 )
-                foreign = Image.new("L", size, 0)
-                for other_cues, other_style in others:
-                    for other in other_cues:
-                        if not (other.text or "").strip():
-                            continue
-                        if float(other.start_sec) <= mid < float(other.end_sec):
-                            foreign = ImageChops.lighter(
-                                foreign,
-                                _glyph_mask(
-                                    other.text, other_style, size, work, cache
-                                ).filter(ImageFilter.MaxFilter(5)),
-                            )
+                foreign = _foreign_footprint(others, mid, size, work, cache, 5, guard)
                 footprint = ImageChops.subtract(own, foreign)
                 diff = _binary(ImageChops.difference(out, ref), delta)
                 changed = _count(ImageChops.multiply(diff, footprint))
@@ -884,15 +998,24 @@ def _postflight(
             )
         visible_sections.append((visible, style))
 
+    # ONE sample time per cue, used by both presence and OCR (B9-H1).
+    guard = _sample_guard(plan.fps)
+    for i, (rendered, _) in enumerate(visible_sections):
+        others = [s for j, s in enumerate(plan.sections) if j != i]
+        for cue in rendered:
+            cue.sample_sec = _sample_time(cue, others, guard)
+
     mask_cache = _MaskCache()  # bounded, shared by all tracks (B4BR2-M2)
     for i, (rendered, style) in enumerate(visible_sections):
+        others = [s for j, s in enumerate(plan.sections) if j != i]
         presence = burnin_presence(
             candidate,
             reference,
             rendered,
             style,
-            others=[s for j, s in enumerate(plan.sections) if j != i],
+            others=others,
             mask_cache=mask_cache,
+            fps=plan.fps,
         )
         results["burnin_presence"].append({"track": i, **presence})
         if presence["status"] != "pass":
@@ -904,8 +1027,29 @@ def _postflight(
                 f"(< {defaults.RENDER_BURNIN_OCR_MIN_GLYPH_PX}px); pixel presence only"
             )
             continue
+
+        def _foreign(at_sec: float, size: tuple[int, int], _others=others):
+            # Another track's glyphs are scrubbed (replaced by reference
+            # pixels) before this track's band is OCR'd (B9), with the same
+            # sample time and `_maybe_shown` rule as the presence check.
+            with tempfile.TemporaryDirectory(prefix="render_ocr_") as d:
+                mask = _foreign_footprint(
+                    _others,
+                    at_sec,
+                    size,
+                    Path(d),
+                    mask_cache,
+                    OCR_FOREIGN_DILATE,
+                    guard,
+                )
+            return mask if mask.getbbox() else None
+
         ocr_result = qc_orchestrator.postflight_burnin(
-            candidate, rendered, reference_path=reference, style=style
+            candidate,
+            rendered,
+            reference_path=reference,
+            style=style,
+            foreign_mask=_foreign,
         )
         results["burnin_ocr"].append({"track": i, **ocr_result.to_dict()})
         if ocr_result.status == "pass" or not ocr_result.applicable:

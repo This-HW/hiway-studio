@@ -12,8 +12,23 @@ from __future__ import annotations
 from pathlib import Path
 
 
+# ASS Dialogue times have centisecond resolution: a cue boundary is shown at
+# its time ROUNDED to 0.01s (B9-H1). The render postflight decides which cue
+# is on screen with `ass_time`, never with the raw float.
+ASS_TIME_QUANTUM_SEC: float = 0.01
+
+
+def _ass_cs(seconds: float) -> int:
+    return int(round(float(seconds) * 100))
+
+
+def ass_time(seconds: float) -> float:
+    """The time (s) `_ass_timestamp(seconds)` really writes into the ASS."""
+    return _ass_cs(seconds) / 100
+
+
 def _ass_timestamp(seconds: float) -> str:
-    total_cs = int(round(seconds * 100))
+    total_cs = _ass_cs(seconds)
     h, rem = divmod(total_cs, 360000)
     m, rem = divmod(rem, 6000)
     s, cs = divmod(rem, 100)

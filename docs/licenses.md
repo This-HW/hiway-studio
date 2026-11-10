@@ -26,6 +26,9 @@
 | typescript | 웹 타입 시스템 | Apache-2.0 |
 | zustand | 웹 상태 관리 | MIT |
 | tanstack-query | 웹 데이터 패칭 | MIT |
+| eslint, @eslint/eslintrc, eslint-config-next | 웹 lint (`npm run lint`, devDependencies) | MIT |
+| postcss (npm `overrides`로 8.5.32 고정) | next 내부 CSS 처리 (next 15.5.28이 고정한 8.4.31의 보안 취약점 대체) | MIT |
+| sharp (next 15의 optionalDependency, 레포가 직접 쓰지 않음) | next 이미지 최적화. 플랫폼별 prebuilt libvips 바이너리를 함께 받는다 | Apache-2.0 (libvips 바이너리 LGPL-3.0-or-later, 재배포하지 않음) |
 
 ## Phase 3 추가
 

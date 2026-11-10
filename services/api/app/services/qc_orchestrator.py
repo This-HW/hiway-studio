@@ -38,6 +38,7 @@ import logging
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -854,25 +855,63 @@ def subtitle_band(width: int, height: int, style: dict | None) -> tuple[int, int
     return (0, height - band, width, height)
 
 
-def _band_text(video: Any, at_sec: float, style: dict | None, dst: Path) -> str:
-    """Extract the frame at `at_sec`, crop the subtitle band, OCR it and
-    return the normalized confident text (reading order kept).
+def _decode_frame(video: Any, at_sec: float, dst: Path) -> Image.Image:
+    """The RGB frame of `video` at `at_sec` (saved next to `dst`).
 
-    Raises OSError/StudioError when no frame can be decoded and lets OCR
-    errors propagate (the caller records them as failures)."""
+    Raises OSError/StudioError when no frame can be decoded."""
     frame = dst.with_name(dst.stem + "_frame.png")
     _extract_frame_file(video, at_sec, frame)
     if not frame.is_file() or frame.stat().st_size == 0:
         raise OSError(f"no frame decoded at {at_sec:.2f}s of {Path(str(video)).name}")
     with Image.open(frame) as img:
-        img.convert("RGB").crop(subtitle_band(img.width, img.height, style)).save(dst)
+        return img.convert("RGB")
+
+
+def _band_ocr(img: Image.Image, style: dict | None, dst: Path) -> str:
+    """Crop the subtitle band of `img`, OCR it and return the normalized
+    confident text (reading order kept). OCR errors propagate (the caller
+    records them as failures)."""
+    img.crop(subtitle_band(img.width, img.height, style)).save(dst)
     hits = ocr.recognize(str(dst))
     return _norm_burnin("".join(
         h["text"] for h in hits if h["confidence"] >= defaults.OCR_CONFIDENCE_LOW))
 
 
+def _scrub_foreign(img: Image.Image, mask: Image.Image | None,
+                   fill: Image.Image | None) -> int:
+    """Replace, in place, every pixel of `img` under `mask` (another track's
+    glyph footprint, mode L, 255 = foreign) with the same pixel of `fill`
+    (the subtitle-free reference frame; black without one). Returns the
+    number of pixels scrubbed. It removes the other track's pixels only as
+    far as `mask` covers them, and the restored reference pixels can show
+    background strokes; OCR is not monotonic. See `postflight_burnin` for
+    when this is sound (B9-L1)."""
+    if mask is None:
+        return 0
+    if mask.size != img.size:
+        raise ValueError(f"foreign mask {mask.size} != frame {img.size}")
+    mask = mask.convert("L").point(lambda v: 255 if v else 0)
+    scrubbed = mask.histogram()[255]
+    if scrubbed:
+        if fill is None or fill.size != img.size:
+            fill = Image.new("RGB", img.size, "black")
+        img.paste(fill, (0, 0), mask)
+    return scrubbed
+
+
 def _cue_field(cue: Any, name: str) -> Any:
     return cue.get(name) if isinstance(cue, dict) else getattr(cue, name, None)
+
+
+def _sample_sec(cue: Any) -> float:
+    """The cue's `sample_sec` (chosen by the render postflight, B9-H1), else
+    its midpoint."""
+    at = _cue_field(cue, "sample_sec")
+    if at is not None:
+        return float(at)
+    start = float(_cue_field(cue, "start_sec") or 0.0)
+    end = float(_cue_field(cue, "end_sec") or start)
+    return (start + end) / 2
 
 
 BURNIN_SYMBOL_ONLY = "symbol_only"
@@ -890,13 +929,19 @@ def burnin_symbol_only_unverified(result: CheckResult) -> bool:
     return bool(symbol) and all("reference_similarity" in e for e in others)
 
 
+ForeignMask = Callable[[float, tuple[int, int]], "Image.Image | None"]
+
+
 def postflight_burnin(output_path: Any, cues: Any, *,
                       reference_path: Any = None,
                       style: dict | None = None,
-                      min_match: float | None = None) -> CheckResult:
+                      min_match: float | None = None,
+                      foreign_mask: ForeignMask | None = None) -> CheckResult:
     """Render postflight: burned-in subtitles were really ADDED and are legible.
 
-    For every cue with text, at the cue midpoint:
+    For every cue with text, at the cue's sample time (`sample_sec` when the
+    cue has one — the render postflight picks it away from the other tracks'
+    ASS cue boundaries, B9-H1 — else the midpoint):
     1. crop the subtitle band of the output frame (`subtitle_band`, from
        `style` position / safe-area margin; default bottom) and OCR it;
     2. order-preserving similarity (`_ordered_similarity`) of the
@@ -919,7 +964,24 @@ def postflight_burnin(output_path: Any, cues: Any, *,
     absent are not applicable. A non-blank cue without letters/digits
     ("...", "…", "♪") is burned in but cannot be compared by OCR: it is
     listed in `measured` with ``unverifiable: "symbol_only"`` and the verdict
-    is at most warn (`burnin_symbol_only_unverified` recognises that warn)."""
+    is at most warn (`burnin_symbol_only_unverified` recognises that warn).
+
+    Other tracks (dual subtitles, B9 / ADR-0013): `foreign_mask(at_sec,
+    (width, height))` returns the footprint of every OTHER track's glyphs
+    that may be shown in the frame sampled at `at_sec` (mode L, 255 =
+    foreign; None = nothing). Before the output band is OCR'd those pixels
+    are replaced by the reference frame's pixels (`_scrub_foreign`), so
+    another track's text does not lower this track's similarity
+    (overlapping bands: false fail). It cannot stand in for a transparent /
+    missing track ONLY while the mask covers every pixel the other tracks
+    changed in that frame: the scrubbed band then equals the reference band,
+    and (3) fails a text already readable there. That premise needs the mask
+    time to match the frame actually shown (B9-H1: ASS centisecond times,
+    real frame PTS — the render postflight's `_sample_time` /
+    `_maybe_shown`) and the mask to cover the glyphs (dilated footprint).
+    Scrubbing is not "removal only" in general: restored reference pixels
+    can reveal background strokes and OCR is not monotonic in removed
+    pixels (B9-L1). `measured[].scrubbed_px` records the count."""
     code = "burnin_ocr"
     threshold = (min_match if min_match is not None
                  else defaults.RENDER_BURNIN_OCR_MIN_MATCH)
@@ -944,17 +1006,21 @@ def postflight_burnin(output_path: Any, cues: Any, *,
     problems: list[str] = []
     with tempfile.TemporaryDirectory(prefix="qc_burnin_") as d:
         for i, cue in enumerate(targets):
-            start = float(_cue_field(cue, "start_sec") or 0.0)
-            end = float(_cue_field(cue, "end_sec") or start)
-            mid = (start + end) / 2
+            mid = _sample_sec(cue)
             want = _norm_burnin(_cue_field(cue, "text"))
             entry: dict[str, Any] = {"cue": i, "at_sec": round(mid, 2)}
             measured.append(entry)
             try:
-                got = _band_text(output_path, mid, style, Path(d) / f"out_{i}.png")
+                out_img = _decode_frame(output_path, mid, Path(d) / f"out_{i}.png")
+                ref_img = (None if reference_path is None else
+                           _decode_frame(reference_path, mid, Path(d) / f"ref_{i}.png"))
+                if foreign_mask is not None:
+                    entry["scrubbed_px"] = _scrub_foreign(
+                        out_img, foreign_mask(mid, out_img.size), ref_img)
+                got = _band_ocr(out_img, style, Path(d) / f"out_{i}.png")
                 entry["similarity"] = round(_ordered_similarity(want, got), 3)
-                if reference_path is not None:
-                    ref = _band_text(reference_path, mid, style, Path(d) / f"ref_{i}.png")
+                if ref_img is not None:
+                    ref = _band_ocr(ref_img, style, Path(d) / f"ref_{i}.png")
                     entry["reference_similarity"] = round(_ordered_similarity(want, ref), 3)
             except Exception as e:  # noqa: BLE001 — frame/OCR failure of a required gate
                 entry["error"] = _short(e, 120)
@@ -967,9 +1033,7 @@ def postflight_burnin(output_path: Any, cues: Any, *,
                 problems.append(f"cue {i} @{mid:.2f}s: {want!r} already present in the "
                                 "reference (no burned-in subtitle distinguishable)")
     for i, cue in symbol_only:
-        start = float(_cue_field(cue, "start_sec") or 0.0)
-        end = float(_cue_field(cue, "end_sec") or start)
-        measured.append({"cue": i, "at_sec": round((start + end) / 2, 2),
+        measured.append({"cue": i, "at_sec": round(_sample_sec(cue), 2),
                          "unverifiable": BURNIN_SYMBOL_ONLY})
     if problems:
         return CheckResult(code, "fail",

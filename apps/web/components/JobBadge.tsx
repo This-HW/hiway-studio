@@ -3,6 +3,7 @@
 "use client";
 
 import { useState } from "react";
+import { isJobActionable, isRetryableFailure, jobLabel } from "@/lib/jobs-api";
 import type { SseConnectionState } from "@/lib/sse";
 import { useWorkspaceStore } from "@/stores/workspace";
 
@@ -33,6 +34,17 @@ export function JobBadge() {
   const [open, setOpen] = useState(false);
   const jobs = useWorkspaceStore((s) => s.jobs);
   const sseState = useWorkspaceStore((s) => s.sseState);
+  const retryJob = useWorkspaceStore((s) => s.retryJob);
+  const cancelJob = useWorkspaceStore((s) => s.cancelJob);
+  // Job ids with a retry/cancel request in flight; an accepted cancel stays
+  // disabled until job.canceled (or a durable read) moves the row.
+  const [acting, setActing] = useState<Record<string, boolean>>({});
+  const act = (id: string, action: () => Promise<boolean>, keepOnSuccess: boolean) => {
+    setActing((a) => ({ ...a, [id]: true }));
+    void action().then((ok) => {
+      if (!ok || !keepOnSuccess) setActing((a) => ({ ...a, [id]: false }));
+    });
+  };
 
   const active = Object.values(jobs).filter(
     (j) => j.status === "queued" || j.status === "running"
@@ -64,7 +76,7 @@ export function JobBadge() {
               <div key={j.job_id} className="job-row">
                 <div className="row" style={{ justifyContent: "space-between" }}>
                   <span className="small" style={{ fontWeight: 600 }}>
-                    {j.job_type || "작업"}
+                    {jobLabel(j)}
                   </span>
                   <span className="small muted">{j.progress_pct}%</span>
                 </div>
@@ -74,6 +86,16 @@ export function JobBadge() {
                 </div>
                 {j.eta_sec !== undefined && (
                   <div className="small muted">예상 {j.eta_sec}초 남음</div>
+                )}
+                {isJobActionable(j.job_type) && (
+                  <button
+                    className="btn btn-ghost small"
+                    disabled={acting[j.job_id]}
+                    aria-label={`${jobLabel(j)} 취소`}
+                    onClick={() => act(j.job_id, () => cancelJob(j), true)}
+                  >
+                    {acting[j.job_id] ? "취소 요청됨" : "취소"}
+                  </button>
                 )}
               </div>
             ))}
@@ -94,10 +116,23 @@ export function JobBadge() {
                     >
                       {j.status === "completed" ? "완료" : "실패"}
                     </span>{" "}
-                    <span className="small">{j.job_type || "작업"}</span>
+                    <span className="small">{jobLabel(j)}</span>
                     {j.error_code && (
                       <div className="small muted">{j.error_code}</div>
                     )}
+                    {j.status === "failed" &&
+                      !j.verifying &&
+                      isJobActionable(j.job_type) &&
+                      isRetryableFailure(j.error_code) && (
+                        <button
+                          className="btn small"
+                          disabled={acting[j.job_id]}
+                          aria-label={`${jobLabel(j)} 재시도`}
+                          onClick={() => act(j.job_id, () => retryJob(j), false)}
+                        >
+                          재시도
+                        </button>
+                      )}
                   </div>
                 ))}
               </>

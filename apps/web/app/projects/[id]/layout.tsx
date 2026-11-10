@@ -4,7 +4,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { useParams, usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect } from "react";
 import type { ReactNode } from "react";
 import { JobBadge } from "@/components/JobBadge";
@@ -30,16 +30,12 @@ const TABS = [
   { key: "settings", label: "설정", ready: true },
 ] as const;
 
-export default function ProjectLayout({
-  children,
-  params,
-}: {
-  children: ReactNode;
-  params: { id: string };
-}) {
+export default function ProjectLayout({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const projectId = params.id;
+  // Next 15 passes layout `params` as a Promise; a client layout reads the
+  // route segment with useParams() instead (same as the tab pages).
+  const projectId = useParams<{ id: string }>().id;
 
   const setProjectId = useWorkspaceStore((s) => s.setProjectId);
   const setProject = useWorkspaceStore((s) => s.setProject);

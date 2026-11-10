@@ -191,6 +191,12 @@ export interface JobInfo {
   eta_sec?: number;
   error_code?: string;
   error_message?: string;
+  /**
+   * A terminal SSE event inside the retry verify window that the server has
+   * not confirmed yet (it may be the old attempt's): screens must not settle
+   * on it (stores/workspace.ts RETRY_VERIFY_WINDOW_MS).
+   */
+  verifying?: boolean;
 }
 
 // --- Phase 2: scenes / shots (P0-9) ---
