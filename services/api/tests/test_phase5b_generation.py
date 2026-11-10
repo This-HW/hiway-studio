@@ -32,7 +32,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.db.session as sess_mod
-from app.core.celery_app import register_job_dispatcher
+from app.core.celery_app import _JOB_DISPATCHERS
 from app.core.config import get_settings
 from app.core.middleware import register_middleware
 from app.core.sse_bridge import reset_bridge
@@ -77,7 +77,9 @@ def client(tmp_path, monkeypatch):
         "q.p1.run_style_extract",
         "q.image.run_generation",
     ):
-        register_job_dispatcher(task_name, lambda *a: None)
+        # setitem: restored after the test, so the no-op does not leak into
+        # later test files that rely on eager q.image dispatch.
+        monkeypatch.setitem(_JOB_DISPATCHERS, task_name, lambda *a: None)
 
     api = FastAPI()
     register_middleware(api)
@@ -266,7 +268,7 @@ def test_lora_train_few_images_guard_and_confirm(client):
         # The worker completes the stub training synchronously here.
         result = lora_service.complete_train(db, lora_id)
         assert result["status"] == "ready"
-        assert result["model_path"].endswith("heroink.safetensors")
+        assert result["model_path"].endswith(f"{lora_id}.safetensors")
         ch = db.get(Character, char_id)
         assert ch.consistency_method == "lora"
 
@@ -284,6 +286,7 @@ def test_style_extract_count_rules(client):
     r = client.post(f"/api/v1/style-kits/{kit_id}/extract",
                     json={"source_asset_ids": aids})
     assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]  # the extraction job (task argument, ADR-0008)
     assert r.json()["warning"] is not None  # <3 sources: warn but proceed
     assert r.json()["images_used"] == 2
 
@@ -296,7 +299,7 @@ def test_style_extract_count_rules(client):
     assert r.json()["images_used"] == 8  # >8: first 8 only
 
     with session_scope() as db:
-        result = extract_service.complete_extract(db, str(kit_id))
+        result = extract_service.complete_extract(db, job_id)
         assert result["status"] == "succeeded"
         kit = db.get(StyleKit, kit_id)
         assert kit.color is not None and kit.version == 2

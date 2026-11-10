@@ -155,7 +155,8 @@ function LoraTrainingCard({ characterId, references }: { characterId: string; re
   );
 }
 
-function MasterThumb({ c }: { c: Character }) {  const url = c.master_thumbnail_url ?? resolveFileUrl(null);
+function MasterThumb({ c }: { c: Character }) {
+  const url = resolveFileUrl(c.master_thumbnail);
   if (url) {
     return <img src={url} alt={c.name} className="thumb square" />;
   }
@@ -179,21 +180,18 @@ export default function CharactersPage() {
 
   // Watch SSE job completions for pending master generations.
   useEffect(() => {
-    const pending = s.masterJobByCharacter;
-    for (const [characterId, jobId] of Object.entries(pending)) {
-      const job = jobs[jobId];
-      if (!job) continue;
-      if (job.status === "completed") {
-        s.markMasterJobDone(characterId);
+    for (const done of s.settleMasterJobs(jobs)) {
+      if (done.status === "completed") {
         toast("마스터 초상이 생성되었습니다.");
         void s.refreshDetail();
         void s.loadCharacters();
-      } else if (job.status === "failed") {
-        s.markMasterJobDone(characterId);
+      } else if (done.status === "failed") {
         toast(
-          `마스터 생성 실패: ${job.error_code ?? "알 수 없는 오류"}`,
+          `마스터 생성 실패: ${done.errorCode ?? "알 수 없는 오류"}`,
           { kind: "error" }
         );
+      } else {
+        toast("마스터 초상 생성이 취소되었습니다.");
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

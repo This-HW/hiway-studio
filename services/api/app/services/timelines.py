@@ -14,12 +14,13 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.core.contracts import check_enum
 from app.core.errors import ErrorCode, StudioError
 from app.services import videos as video_service
-from app.services.render import _require_editable
+from app.services.render import _require_editable, render_locked
 
 
 def _get_project(db: Session, project_id: uuid.UUID):
@@ -161,11 +162,57 @@ def _validate_clip_entry(db: Session, entry: dict[str, Any], index: int) -> dict
     }
 
 
-def _mark_edited(timeline) -> None:
-    # Editing a finished timeline returns it to draft (re-render required).
-    if timeline.status == "done":
-        check_enum("render_status", "draft")
-        timeline.status = "draft"
+def _mark_edited(db: Session, timeline) -> None:
+    """A content edit returns a finished timeline to draft (re-render required).
+
+    Conditional UPDATE against the CURRENT row (B4B-H4): only `done` becomes
+    `draft`; a cached status is never written back, so a render claim that
+    committed after this session read the timeline is never overwritten."""
+    from app.models.timeline import Timeline
+
+    check_enum("render_status", "draft")
+    db.flush()
+    db.execute(
+        update(Timeline)
+        .where(Timeline.id == timeline.id, Timeline.status == "done")
+        .values(status="draft")
+        .execution_options(synchronize_session=False)
+    )
+    db.expire(timeline, ["status"])
+
+
+def _lock_timeline(db: Session, timeline_id: uuid.UUID):
+    """Row-lock the timeline (SELECT ... FOR NO KEY UPDATE; SQLite serializes
+    writers) and reload it; 409 RENDER_LOCKED when it is rendering now.
+
+    THE lock order of every timeline edit (B4BR2-M1): Project (only when the
+    subtitle selection / mode changes, `lock_subtitle_scope`) -> Timeline
+    (here) -> clip / content rows. Taken before any `timeline_clips` write,
+    so a clip-only edit and a rename + clip edit can never hold the clip
+    rows and the Timeline row in opposite order (Postgres 40P01)."""
+    from app.models.timeline import Timeline
+    from app.services.generations import lock_row
+
+    timeline = lock_row(db, Timeline, timeline_id)
+    if timeline is None:
+        raise StudioError(ErrorCode.NOT_FOUND, "Timeline not found.")
+    _require_editable(timeline)
+    return timeline
+
+
+def _rename(db: Session, timeline, name: str) -> None:
+    """Metadata-only write: conditional on not rendering, never touches status."""
+    from app.models.timeline import Timeline
+
+    result = db.execute(
+        update(Timeline)
+        .where(Timeline.id == timeline.id, Timeline.status != "rendering")
+        .values(name=name)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        raise render_locked(timeline.id)
+    db.expire(timeline, ["name", "status"])
 
 
 def bump_content_version(db: Session, timeline_id: uuid.UUID) -> int:
@@ -173,10 +220,26 @@ def bump_content_version(db: Session, timeline_id: uuid.UUID) -> int:
 
     Call after every edit that changes what a render would produce: cut
     list, audio clips, subtitle cues/style/mode/track selection.
+
+    Also the render lock (F13): the bump is a conditional UPDATE that only
+    matches a timeline that is not rendering, so it serializes with
+    request_render's claim — an edit racing a render claim either lands
+    before it (the claim then sees a new content_version and fails as stale)
+    or raises 409 RENDER_LOCKED.
     """
+    from app.models.timeline import Timeline
+
     timeline = _get_timeline(db, timeline_id)
-    timeline.content_version = (timeline.content_version or 0) + 1
-    db.flush()
+    db.flush()  # pending ORM edits first; the UPDATE below must not be lost
+    result = db.execute(
+        update(Timeline)
+        .where(Timeline.id == timeline.id, Timeline.status != "rendering")
+        .values(content_version=func.coalesce(Timeline.content_version, 0) + 1)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        raise render_locked(timeline.id)
+    db.expire(timeline, ["content_version", "status"])
     return timeline.content_version
 
 
@@ -189,24 +252,44 @@ def update_timeline(
     subtitle_mode: str | None = None,
     subtitle_track_ids: list[str] | None = None,
 ) -> Any:
+    """Edit a timeline. Every write is guarded against a concurrent render
+    claim by the CURRENT row state (B4B-H4): content edits through the
+    conditional `bump_content_version`, the name through a conditional
+    UPDATE, and done -> draft only through `_mark_edited`'s conditional
+    UPDATE — a status read earlier by this session is never written back.
+    Track selection / subtitle mode changes first take the subtitle scope
+    lock shared with cue/style/track edits (B4B-H3). Lock order (B4BR2-M1):
+    Project (selection / mode only) -> Timeline -> clip rows, the Timeline
+    row lock taken before ANY write of this edit."""
     timeline = _get_timeline(db, timeline_id)
-    _require_editable(timeline)  # 409 RENDER_LOCKED while rendering
-    if name is not None:
-        timeline.name = name.strip() or timeline.name
+    _require_editable(timeline)  # 409 RENDER_LOCKED while rendering (fast path)
+    if subtitle_mode is not None or subtitle_track_ids is not None:
+        from app.services.subtitles import lock_subtitle_scope
+
+        # First lock of this transaction (order project -> timeline).
+        lock_subtitle_scope(db, timeline.project_id)
+    # Timeline row lock before any clip/content write; reloads the row (the
+    # selection / status as committed now, under the lock).
+    timeline = _lock_timeline(db, timeline.id)
+    content_changed = False
+    if name is not None and name.strip():
+        _rename(db, timeline, name.strip())
     if clip_order is not None:
         _set_clips(db, timeline.id, clip_order)
         bump_content_version(db, timeline.id)
+        content_changed = True
     if subtitle_mode is not None:
         check_enum("subtitle_mode", subtitle_mode)
         if timeline.subtitle_mode != subtitle_mode:
             timeline.subtitle_mode = subtitle_mode
             bump_content_version(db, timeline.id)
+            content_changed = True
     if subtitle_track_ids is not None:
         from app.models.subtitle import SubtitleTrack
 
         ids = [str(x) for x in subtitle_track_ids]
         for tid in ids:
-            track = db.get(SubtitleTrack, uuid.UUID(tid))
+            track = db.get(SubtitleTrack, uuid.UUID(tid), populate_existing=True)
             if track is None or track.project_id != timeline.project_id:
                 raise StudioError(
                     ErrorCode.VALIDATION_ERROR,
@@ -215,6 +298,7 @@ def update_timeline(
         if (timeline.subtitle_track_ids or []) != ids:
             timeline.subtitle_track_ids = ids
             bump_content_version(db, timeline.id)
+            content_changed = True
     # Design §4.15: single burns 1 track, dual burns 2.
     mode_now = timeline.subtitle_mode or "single"
     ids_now = timeline.subtitle_track_ids or []
@@ -225,7 +309,8 @@ def update_timeline(
             f"subtitle_mode={mode_now!r} accepts at most {limit} track(s), "
             f"got {len(ids_now)}.",
         )
-    _mark_edited(timeline)
+    if content_changed:
+        _mark_edited(db, timeline)
     db.flush()
     return timeline
 
@@ -235,7 +320,8 @@ def build_from_shots(db: Session, timeline_id: uuid.UUID) -> Any:
     from app.models.production import Scene, Shot
 
     timeline = _get_timeline(db, timeline_id)
-    _require_editable(timeline)
+    _require_editable(timeline)  # fast path
+    timeline = _lock_timeline(db, timeline.id)  # B4BR2-M1: before clip writes
     scenes = (
         db.query(Scene)
         .filter(Scene.project_id == timeline.project_id)
@@ -264,6 +350,6 @@ def build_from_shots(db: Session, timeline_id: uuid.UUID) -> Any:
             )
     _set_clips(db, timeline.id, entries)
     bump_content_version(db, timeline.id)
-    _mark_edited(timeline)
+    _mark_edited(db, timeline)
     db.flush()
     return timeline

@@ -1,15 +1,17 @@
 """Shot generation / job routes (F-06, F-07, P0-14, design §8.1).
 
-Generation POSTs accept an optional `Idempotency-Key` header: within the
-configured window a repeated key replays the original response instead of
-creating new jobs (design §12.2, defaults.IDEMPOTENCY_WINDOW_SEC).
+Generation POSTs accept an optional `Idempotency-Key` header: within
+defaults.IDEMPOTENCY_TTL_SEC a repeated key on the same request path replays
+the original response instead of creating new jobs (design §12.2, plan D2,
+services.idempotency).
 """
 from __future__ import annotations
 
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -29,32 +31,17 @@ from app.services import idempotency
 router = APIRouter(tags=["generations"])
 
 
-def _with_idempotency(
-    route_template: str, key: str | None, create
-) -> JobAcceptedResponse:
-    """Run `create()` once per key inside the idempotency window."""
-    if key:
-        hit = idempotency.recall(route_template, key)
-        if hit is not None:
-            return hit
-    result = create()
-    response = JobAcceptedResponse.model_validate(result)
-    if key:
-        idempotency.remember(route_template, key, response)
-    return response
-
-
 @router.post("/shots/{shot_id}/frame", response_model=JobAcceptedResponse, status_code=202)
 def generate_frame(
     shot_id: uuid.UUID,
     body: FrameGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> JobAcceptedResponse:
-    return _with_idempotency(
-        "POST /shots/{shot_id}/frame",
-        idempotency_key,
-        lambda: generation_service.enqueue_frame(
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: generation_service.enqueue_frame(
             db,
             shot_id,
             model_id=body.model_id,
@@ -70,13 +57,13 @@ def generate_frame(
 def retake(
     shot_id: uuid.UUID,
     body: RetakeRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> JobAcceptedResponse:
-    return _with_idempotency(
-        "POST /shots/{shot_id}/retake",
-        idempotency_key,
-        lambda: generation_service.enqueue_retake(
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: generation_service.enqueue_retake(
             db,
             shot_id,
             model_id=body.model_id,
@@ -91,13 +78,13 @@ def retake(
 def inpaint(
     shot_id: uuid.UUID,
     body: InpaintRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> JobAcceptedResponse:
-    return _with_idempotency(
-        "POST /shots/{shot_id}/inpaint",
-        idempotency_key,
-        lambda: generation_service.enqueue_inpaint(
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: generation_service.enqueue_inpaint(
             db,
             shot_id,
             generation_id=body.generation_id,
@@ -112,13 +99,13 @@ def inpaint(
 def upscale(
     shot_id: uuid.UUID,
     body: UpscaleRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> JobAcceptedResponse:
-    return _with_idempotency(
-        "POST /shots/{shot_id}/upscale",
-        idempotency_key,
-        lambda: generation_service.enqueue_upscale(
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: generation_service.enqueue_upscale(
             db, shot_id, generation_id=body.generation_id, model_id=body.model_id
         ),
     )
@@ -128,13 +115,13 @@ def upscale(
 def outpaint(
     shot_id: uuid.UUID,
     body: OutpaintRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> JobAcceptedResponse:
-    return _with_idempotency(
-        "POST /shots/{shot_id}/outpaint",
-        idempotency_key,
-        lambda: generation_service.enqueue_outpaint(
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: generation_service.enqueue_outpaint(
             db,
             shot_id,
             generation_id=body.generation_id,

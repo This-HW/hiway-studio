@@ -1,10 +1,18 @@
 // Backend DTO shapes for Phase 1 screens.
 //
 // Source of truth is the API spec (§8.1) mirrored in packages/contracts.
-// This file is a hand-written stand-in until `make gen-types` lands;
-// keep it in sync with the contracts package when the backend evolves.
+// Contract enums, error codes and SSE payloads are GENERATED into
+// lib/contracts.gen.ts (`make gen-types`) and re-exported here; the DTO
+// shapes below are hand-written mirrors of the backend read schemas.
 
-export type AspectRatio = "16:9" | "9:16" | "1:1" | "2.39:1" | "4:5";
+import type { AspectRatio, ConsistencyMethod } from "./contracts.gen";
+export type { AspectRatio } from "./contracts.gen";
+export { SHOT_REFERENCE_PURPOSE as SHOT_REFERENCE_PURPOSES } from "./contracts.gen";
+export type {
+  JobCompletedPayload,
+  JobFailedPayload,
+  JobProgressPayload,
+} from "./contracts.gen";
 
 export type CharacterScope = "project" | "global" | "all";
 
@@ -30,23 +38,32 @@ export interface DefaultModels {
   tts_model_id?: string;
 }
 
+/** Matches backend ProjectRead (schemas/project.py), list and detail alike. */
 export interface Project {
   id: string;
   title: string;
   aspect_ratio: AspectRatio;
-  category_pack_code?: string | null;
-  category_pack_name?: string | null;
-  default_models?: DefaultModels | null;
-  monthly_budget_usd?: number | null;
-  is_archived?: boolean;
-  shot_count?: number;
-  approved_shot_count?: number;
-  clip_count?: number;
-  monthly_cost_estimated_usd?: number;
-  monthly_cost_actual_usd?: number;
-  thumbnail_url?: string | null;
-  created_at?: string;
-  updated_at?: string;
+  default_style: string | null;
+  default_models: DefaultModels;
+  style_kit_id: string | null;
+  category_pack_code: string | null;
+  category_pack_name: string | null;
+  /** wire: Decimal serializes as a JSON string. */
+  monthly_budget_usd: string | null;
+  is_archived: boolean;
+  episode_count: number;
+  scene_count: number;
+  // Project-card summary (P0_SCREENS §1).
+  /** Relative path of the first scene's first shot's approved frame; resolveFileUrl(). */
+  thumbnail: string | null;
+  shot_count: number;
+  approved_shot_count: number;
+  clip_count: number;
+  /** Current UTC month, USD. */
+  monthly_cost_estimated_usd: number;
+  monthly_cost_actual_usd: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Story {
@@ -90,8 +107,8 @@ export interface Character {
   negative_prompt?: string | null;
   consistency_method?: string | null;
   version: number;
-  /** Not in backend CharacterRead yet; used when present, else placeholder. */
-  master_thumbnail_url?: string | null;
+  /** Relative path of the primary master thumbnail (CharacterRead); resolveFileUrl(). */
+  master_thumbnail?: string | null;
   referencing_shots?: number;
   created_at?: string;
   updated_at?: string;
@@ -141,7 +158,8 @@ export interface AssetUploadResponse {
 
 export type AssetKind = "background" | "location" | "prop";
 
-/** Backend ConsistencyMethod literal (schemas/character.py). */
+/** Backend ConsistencyMethod literal (schemas/character.py), in UI order
+ * (default first). Checked against the contract enum. */
 export const CONSISTENCY_METHODS = [
   "hybrid",
   "reference_image",
@@ -150,7 +168,7 @@ export const CONSISTENCY_METHODS = [
   "faceid",
   "pulid",
   "seed_locked",
-] as const;
+] as const satisfies readonly ConsistencyMethod[];
 
 export interface JobStarted {
   job_id: string;
@@ -162,34 +180,7 @@ export interface SheetStarted {
   estimated_cost_usd?: string;  // wire: Decimal serializes as JSON string
 }
 
-// --- SSE payloads (see packages/contracts/sse_events.json) ---
-
-export interface JobProgressPayload {
-  job_id: string;
-  job_type: string;
-  progress_pct: number;
-  stage: string;
-  status: string;
-  eta_sec?: number;
-}
-
-export interface JobCompletedPayload {
-  job_id: string;
-  job_type: string;
-  status: string;
-  output_count: number;
-  output_path?: string;
-}
-
-export interface JobFailedPayload {
-  job_id: string;
-  job_type: string;
-  error_code: string;
-  error_message: string;
-  retry_count: number;
-  max_retries: number;
-  retryable: boolean;
-}
+// SSE payloads: generated (lib/contracts.gen.ts), re-exported at the top.
 
 export interface JobInfo {
   job_id: string;
@@ -298,14 +289,6 @@ export interface JobAccepted {
   job_id: string;
   estimated_cost_usd: string;  // wire: Decimal serializes as JSON string
 }
-
-export const SHOT_REFERENCE_PURPOSES = [
-  "primary",
-  "expression",
-  "outfit",
-  "location",
-  "continuity",
-] as const;
 
 /** Phase 3: video clip (I2V/T2V) attached to a shot. */
 export interface VideoClip {
@@ -434,6 +417,9 @@ export interface QCCheck {
   measured: unknown;
   threshold: unknown;
   stub: boolean;
+  // false = not applicable to this run (e.g. encoding_match before render);
+  // excluded from the verdict — show as "미적용", never as "통과".
+  applicable?: boolean;
 }
 
 export interface QCReport {

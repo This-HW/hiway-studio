@@ -3,6 +3,13 @@
 Text-LLM calls (G-12) are synchronous here — the API returns 201 with the
 result. Real text providers arrive as adapters; the stub produces deterministic
 canned output so Phase 1 works without API keys.
+
+Budget (plan D1, B5): before the external call a pending llm_calls row is
+committed under the project budget lock (403 BUDGET_EXCEEDED when over
+budget); the lock is released before the call. The row then settles as
+succeeded (spent), failed (nothing sent / provider refused: released) or
+uncertain (sent, outcome unknown: stays reserved). Each step commits the
+request session, so a settled row survives a later error in the request.
 """
 from __future__ import annotations
 
@@ -20,6 +27,7 @@ from app.models.story import Beat, Story
 from app.models.system import LLMCall
 from app.models_lib import registry, router as model_router
 from app.models_lib.adapters.http_polling import poll_until_done
+from app.services import budget_guard, cost_estimator, job_execution
 
 SYNOPSIS_TEMPLATE = "synopsis/v1"
 BEATS_TEMPLATE = "beats/v1"
@@ -67,7 +75,7 @@ def _call_text_llm(
     input_text: str,
     model_id: str | None,
 ) -> LLMCall:
-    """Run one text-LLM call synchronously and record the LLMCall row."""
+    """Run one text-LLM call synchronously with a budget reservation (D1)."""
     check_enum("llm_purpose", purpose)
     routed = model_router.route(
         task="text_llm",
@@ -82,26 +90,46 @@ def _call_text_llm(
             f"Model {routed['model_id']} is not a text LLM.",
         )
     adapter = registry.get_adapter(routed["adapter"])
-    provider_job_id = adapter.submit(routed["model_id"], {"task": purpose, "prompt": input_text})
-    final = poll_until_done(adapter, provider_job_id)
+    # Prompt size as the token estimate (~4 chars/token); the call commits
+    # its reservation before anything is sent (403 when over budget).
+    estimated = cost_estimator.estimate(
+        db, routed["model_id"], chars=len(input_text), tokens=-(-len(input_text) // 4)
+    )
+    call = budget_guard.reserve_llm_call(
+        db,
+        project_id=project_id,
+        purpose=purpose,
+        model_id=routed["model_id"],
+        template=template,
+        template_version=TEMPLATE_VERSION,
+        input_text=input_text,
+        estimated_cost_usd=estimated,
+    )
+    try:
+        provider_job_id = adapter.submit(routed["model_id"], {"task": purpose, "prompt": input_text})
+    except Exception as exc:
+        sent = not job_execution.submit_not_sent(job_execution.as_studio_error(exc))
+        budget_guard.settle_llm_call(
+            db, call, budget_guard.LLM_UNCERTAIN if sent else budget_guard.LLM_FAILED
+        )
+        raise
+    try:
+        final = poll_until_done(adapter, provider_job_id)
+    except Exception:
+        budget_guard.settle_llm_call(db, call, budget_guard.LLM_UNCERTAIN)
+        raise
     if final.state != "succeeded":
+        budget_guard.settle_llm_call(db, call, budget_guard.LLM_FAILED)
         raise StudioError(
             final.error_code or ErrorCode.PROVIDER_ERROR,
             final.error_message or "Text LLM call failed.",
         )
-    output = adapter.fetch_result(provider_job_id).decode("utf-8")
-    call = LLMCall(
-        id=uuid.uuid4(),
-        project_id=project_id,
-        purpose=purpose,
-        model_id=routed["model_id"],
-        system_prompt_template=template,
-        system_prompt_version=TEMPLATE_VERSION,
-        input_text=input_text,
-        output_text=output,
-    )
-    db.add(call)
-    db.flush()
+    try:
+        output = adapter.fetch_result(provider_job_id).decode("utf-8")
+    except Exception:
+        budget_guard.settle_llm_call(db, call, budget_guard.LLM_UNCERTAIN)
+        raise
+    budget_guard.settle_llm_call(db, call, budget_guard.LLM_SUCCEEDED, output_text=output)
     return call
 
 

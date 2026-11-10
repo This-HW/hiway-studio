@@ -21,7 +21,9 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy import Uuid
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.db.base import Base
 
@@ -91,6 +93,12 @@ class Shot(Base):
     )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     frame_stale: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # B4R4-M1: +1 on every invalidation (mark_frame_stale), also when the shot
+    # is already stale. An enqueue clears frame_stale only when this is still
+    # the value it saw when it assembled the prompt (generations).
+    frame_stale_rev: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     continuity_source_shot_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("shots.id"), nullable=True
     )
@@ -105,6 +113,24 @@ class Shot(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+    def mark_frame_stale(self) -> None:
+        """Invalidate the shot's generated frames (F-06, design §8.1).
+
+        The single way to set frame_stale=True: it also bumps frame_stale_rev.
+        On a persisted row the bump is the SQL expression `frame_stale_rev + 1`
+        (evaluated by the UPDATE on the current row, so concurrent
+        invalidations never collapse into one value)."""
+        self.frame_stale = True
+        if sa_inspect(self).persistent:
+            # Always write frame_stale in the same UPDATE as the rev bump: if this
+            # session already loaded True, plain assignment is not a net change and
+            # the ORM would omit it, letting a concurrent enqueue's False survive
+            # (review R5-M1).
+            flag_modified(self, "frame_stale")
+            self.frame_stale_rev = type(self).frame_stale_rev + 1
+        else:
+            self.frame_stale_rev = (self.frame_stale_rev or 0) + 1
 
 
 class ShotReference(Base):

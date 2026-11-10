@@ -11,9 +11,11 @@ from app.models.production import Scene, Shot, ShotReference
 from app.models.project import Project
 from app.models.qc import QCReport
 from app.models.story import Beat, Episode, Story
-from app.models.style import CategoryPack, StyleKit
+from app.models.style import CategoryPack, StyleExtraction, StyleKit
 from app.models.subtitle import SubtitleCue, SubtitleStyle, SubtitleTrack
-from app.models.system import ExportPreset, LLMCall, Model, PromptSnippet
+from app.models.system import (
+    BudgetHold, ExportPreset, IdempotencyRecord, LLMCall, Model, PromptSnippet,
+)
 from app.models.timeline import Timeline, TimelineClip
 from app.models.world_bible import WorldBibleEntry
 
@@ -22,6 +24,7 @@ __all__ = [
     "AudioGeneration",
     "TimelineAudioClip",
     "Beat",
+    "BudgetHold",
     "CategoryPack",
     "Character",
     "CharacterReference",
@@ -32,6 +35,7 @@ __all__ = [
     "ExportPreset",
     "Generation",
     "GenerationAttempt",
+    "IdempotencyRecord",
     "LLMCall",
     "LoraModel",
     "Model",
@@ -44,6 +48,7 @@ __all__ = [
     "Shot",
     "ShotReference",
     "Story",
+    "StyleExtraction",
     "StyleKit",
     "SubtitleCue",
     "SubtitleStyle",

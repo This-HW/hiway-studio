@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -21,22 +22,6 @@ from app.services import dialogue as dialogue_service
 from app.services import idempotency
 
 router = APIRouter(tags=["audio"])
-
-
-def _with_idempotency(
-    route_template: str, key: str | None, create
-) -> p1.DialogueAccepted:
-    """Run `create()` once per key inside the idempotency window."""
-    if key:
-        hit = idempotency.recall(route_template, key)
-        if hit is not None:
-            return p1.DialogueAccepted(job_id=hit.job_id)
-    result = create()
-    response = p1.DialogueAccepted(
-        job_id=result["job_id"], estimated_cost_usd=result.get("estimated_cost_usd"))
-    if key:
-        idempotency.remember(route_template, key, response)
-    return response
 
 
 @router.get("/projects/{project_id}/audio", response_model=list[s.AudioOut])
@@ -98,15 +83,15 @@ def delete_clip(timeline_id: uuid.UUID, clip_id: uuid.UUID,
 def create_dialogue(
     shot_id: uuid.UUID,
     body: p1.DialogueIn,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> p1.DialogueAccepted:
+) -> JSONResponse:
     """Dialogue TTS (design §8.1): 202 {job_id}. Emotion weights are stored
     on the job and passed to the provider; the stub ignores them."""
-    return _with_idempotency(
-        "POST /shots/{shot_id}/dialogue",
-        idempotency_key,
-        lambda: dialogue_service.enqueue_dialogue(
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=p1.DialogueAccepted,
+        create=lambda: dialogue_service.enqueue_dialogue(
             db,
             shot_id,
             character_id=body.character_id,

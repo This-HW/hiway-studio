@@ -13,8 +13,12 @@
   - 예: `docs: sync MODULES.md with actual layout`
 - 하나의 커밋은 하나의 논리 단위. Phase 단위 기능은 Phase별 커밋.
 - 커밋 전 체크리스트:
-  - [ ] `pytest -q` (services/api) 통과
+  - [ ] `pytest -q` (services/api) 통과 — ffmpeg·CJK 폰트가 없으면 해당 테스트는 skip으로 보인다.
+        CI와 `make test`는 `REQUIRE_MEDIA_TOOLS=1`이라 skip 대신 실패한다
   - [ ] `python3 tools/lint_imports.py` 통과 — **의존성 방향 위반 시 커밋 금지**
+  - [ ] `python3 -m ruff check services/api/app services/api/tests` 통과 (최소 규칙)
+  - [ ] contracts(`packages/contracts/*.json`)를 바꿨으면 `make gen-types` 후 `make gen-types-check` 통과
+  - [ ] web을 바꿨으면 `cd apps/web && npm run typecheck && npm run test:sse && npm run test:resync`
   - [ ] 새 설계 결정이 있으면 ADR 작성 (아래)
   - [ ] 새 의존성이 있으면 `docs/licenses.md`에 라이선스 기록
   - [ ] `git status`에 private 파일(`.env`, `projects/`, `library/`, `infra/backups/`)이 없는지 확인
@@ -33,7 +37,9 @@
 - 의존성 방향: `routers → services → models`, `tasks → services/models_lib/media/files`.
   `media`는 `services`를 import하지 않는다. `core`는 아무것도 import하지 않는다.
 - 라우터는 얇게 (검증 → 서비스 호출 → 응답). 프롬프트 조립·비용 계산·상태 전이는 서비스에.
-- Celery 태스크 인자는 `{generation_id}` 단일.
+- Celery 태스크 인자는 대상 행 ID 단일 (`{generation_id}` 등, ADR-0008).
+- 테스트는 서비스 DB를 쓰지 않는다. Postgres로 돌리려면 `TEST_DATABASE_URL`에 이름이 `test`로 끝나는 DB를 준다
+  (`.env`의 `DATABASE_URL`은 무시된다).
 - DB에는 상대경로만 저장 (`app/files/paths.py` 경유).
 - 완료된 산출물은 불변 — 덮어쓰기 금지, 재생성 시 새 파일 + 새 잡.
 - Phase에 없는 파일은 미리 만들지 않는다.

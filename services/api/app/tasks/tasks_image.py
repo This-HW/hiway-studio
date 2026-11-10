@@ -7,9 +7,12 @@ as task arguments (ARCHITECTURE §8).
 Pipeline: route -> submit -> poll -> fetch_result -> save file ->
 update row -> aggregate batch parent -> update shot status -> SSE events.
 
-Retry policy (§12.2): retryable failures are retried up to
-defaults.RETRY_MAX_ATTEMPTS with exponential backoff; every execution is
-recorded as a GenerationAttempt row (F-07).
+Retry policy (§12.2): retryable failures BEFORE the provider submit intent
+are retried up to defaults.RETRY_MAX_ATTEMPTS with exponential backoff; every
+execution is recorded as a GenerationAttempt row (F-07). Execution ownership,
+failure persistence and the D7 submit-intent rule live in
+services/job_execution.py (ADR-0013): once submit intent is committed the job
+is never auto-resubmitted (unknown outcome -> PROVIDER_UNCERTAIN).
 """
 from __future__ import annotations
 
@@ -25,63 +28,81 @@ from app.core.errors import ErrorCode, StudioError
 from app.core.sse_bridge import CHANNEL, get_bridge
 from app.db.session import session_scope
 from app.files import immutability, naming, paths
-from app.models.generation import Generation, GenerationAttempt
-from app.models_lib import registry, router
-from app.models_lib.adapters.http_polling import poll_until_done
-from app.models_lib.base import JobStatus
+from app.models.generation import Generation
+from app.models_lib import capabilities, contract, media_check, registry, router
 from app.core.celery_app import celery_app, register_job_dispatcher
+from app.services import job_execution
 
 log = logging.getLogger("ai_studio.tasks.image")
-
-TERMINAL = ("succeeded", "failed", "canceled")
-
 
 def _now():
     return datetime.now(timezone.utc)
 
 
-def _save_character_image(
-    db, gen: Generation, data: bytes, char_params: dict, ext: str
-) -> str:
-    """Save a character master/sheet image and register its reference row.
+def _write_once(abs_path, data: bytes) -> None:
+    immutability.write_new(paths.ensure_parent(abs_path), data)
 
-    Phase-1 character pipeline completion (D-18/D-19). The generation params
-    carry _character_id/_reference_role/_source/_character_dir; the reference
-    row is created through services.character_pipeline (tasks -> services OK).
-    """
+
+def _thumb_rel(abs_path) -> str | None:
+    """Sibling thumbnail of a just-written image (None when it cannot be made)."""
     from app.media.thumbnails import make_image_thumbnail, thumbnail_path_for
-    from app.services.character_pipeline import reference_for_job
 
+    thumb_abs = thumbnail_path_for(abs_path)
+    try:
+        make_image_thumbnail(abs_path, thumb_abs)
+    except StudioError:
+        log.warning("thumbnail skipped for %s", abs_path.name)
+        return None
+    return paths.assert_relative(paths.to_relative(thumb_abs))
+
+
+def _save_character_image(gen: Generation, data: bytes, char_params: dict, tag: str) -> dict:
+    """Save a character master/sheet image (Phase-1 character pipeline, D-18/D-19).
+
+    Files only: the reference row is created by the token-guarded success
+    transaction (`reference_for_job`). Names are per execution attempt
+    (`tag` = exec token prefix) so a lost or failed attempt's file is an
+    orphan that never blocks a retry (ADR-0013 B4a-fix).
+    """
     char_dir = str(char_params["_character_dir"])
     role = str(char_params["_reference_role"])
+    root = paths.projects_root()
     if role == "master":
-        # ADR-0005: first master keeps the stable master.png path; regenerations
-        # get a new file (outputs are immutable, never overwritten).
-        first = paths.projects_root() / f"{char_dir}/master.png"
-        if first.exists():
-            rel_name = f"{char_dir}/master_{gen.id.hex[:8]}.png"
+        # ADR-0005: the first master keeps the stable master.png path while
+        # it is free. It is taken by exclusive create, so a concurrent master
+        # or an orphan from a lost attempt makes this attempt fall back to a
+        # per-attempt name instead of failing (ADR-0013 B4a-fix).
+        first = f"{char_dir}/master.png"
+        if not (root / first).exists():
+            try:
+                _write_once(root / first, data)
+                rel_name = first
+            except immutability.ImmutableViolation:
+                rel_name = None
         else:
-            rel_name = f"{char_dir}/master.png"
+            rel_name = None
+        if rel_name is None:
+            rel_name = f"{char_dir}/master_{gen.id.hex[:8]}_{tag}.png"
+            _write_once(root / rel_name, data)
     else:
-        rel_name = f"{char_dir}/references/{role}_{gen.id.hex[:8]}.png"
-    abs_path = paths.ensure_parent(paths.projects_root() / rel_name)
-    immutability.write_new(abs_path, data)
+        rel_name = f"{char_dir}/references/{role}_{gen.id.hex[:8]}_{tag}.png"
+        _write_once(root / rel_name, data)
     rel_path = paths.assert_relative(rel_name)
-    reference_for_job(db, gen, rel_path)
-    try:
-        make_image_thumbnail(abs_path, thumbnail_path_for(abs_path))
-    except StudioError:
-        log.warning("thumbnail skipped for %s", rel_path)
-    return rel_path
+    _thumb_rel(root / rel_name)  # character thumbnails live next to the image
+    return {"output_path": rel_path, "thumbnail_path": None, "character": True}
 
 
-def _save_shot_image(db, gen: Generation, data: bytes, ext: str) -> str:
+def _attempt_filename(gen: Generation, tag: str, ext: str) -> str:
+    """`{generation_id}_{batch_index}_{attempt tag}.{ext}` (§11.2 + ADR-0013)."""
+    return naming.single_filename(f"{gen.id}_{gen.batch_index or 0}_{tag}", ext)
+
+
+def _save_shot_image(db, gen: Generation, data: bytes, ext: str, tag: str) -> dict:
     """Save a shot frame take (frame batch child, inpaint, upscale, outpaint).
 
     Location: projects/{project_uuid}/scenes/{scene_uuid}/shots/{shot_uuid}/frames/
-    (ARCHITECTURE §11). Returns the relative path.
+    (ARCHITECTURE §11), one file per execution attempt.
     """
-    from app.media.thumbnails import make_image_thumbnail, thumbnail_path_for
     from app.models.production import Scene, Shot
 
     shot = db.get(Shot, gen.shot_id)
@@ -90,323 +111,328 @@ def _save_shot_image(db, gen: Generation, data: bytes, ext: str) -> str:
     scene = db.get(Scene, shot.scene_id)
     scene_id = scene.id if scene is not None else shot.scene_id
     rel_dir = f"projects/{gen.project_id}/scenes/{scene_id}/shots/{shot.id}/frames"
-    filename = naming.frame_filename(str(gen.id), gen.batch_index or 0, ext)
-    abs_path = paths.ensure_parent(paths.projects_root() / rel_dir / filename)
-    immutability.write_new(abs_path, data)
-    rel_path = paths.assert_relative(f"{rel_dir}/{filename}")
-    try:
-        thumb_abs = thumbnail_path_for(abs_path)
-        make_image_thumbnail(abs_path, thumb_abs)
-        gen.output_thumbnail_path = paths.assert_relative(paths.to_relative(thumb_abs))
-    except StudioError:
-        log.warning("thumbnail skipped for %s", rel_path)
-    return rel_path
+    filename = _attempt_filename(gen, tag, ext)
+    abs_path = paths.projects_root() / rel_dir / filename
+    _write_once(abs_path, data)
+    return {
+        "output_path": paths.assert_relative(f"{rel_dir}/{filename}"),
+        "thumbnail_path": _thumb_rel(abs_path),
+    }
 
 
-def _save_thumbnail_image(db, gen: Generation, data: bytes, thumb_params: dict, ext: str) -> str:
+def _save_thumbnail_image(gen: Generation, data: bytes, thumb_params: dict, tag: str) -> dict:
     """Save a video thumbnail (P1-9, design §10.5, §11.1).
 
-    Location: projects/{project_uuid}/thumbnails/{generation_uuid}_{batch_index}.png.
+    Location: projects/{project_uuid}/thumbnails/{generation_uuid}_{batch_index}_{tag}.png.
     The title text is composited as a post-processing overlay here — never by
     the image model.
     """
     from app.media.thumbnail_text import render_thumbnail
-    from app.media.thumbnails import make_image_thumbnail, thumbnail_path_for
 
     rel_dir = f"projects/{gen.project_id}/thumbnails"
     final = render_thumbnail(data, (thumb_params or {}).get("title_text"))
-    filename = naming.frame_filename(str(gen.id), gen.batch_index or 0, "png")
-    abs_path = paths.ensure_parent(paths.projects_root() / rel_dir / filename)
-    immutability.write_new(abs_path, final)
-    rel_path = paths.assert_relative(f"{rel_dir}/{filename}")
-    try:
-        thumb_abs = thumbnail_path_for(abs_path)
-        make_image_thumbnail(abs_path, thumb_abs)
-        gen.output_thumbnail_path = paths.assert_relative(paths.to_relative(thumb_abs))
-    except StudioError:
-        log.warning("thumbnail skipped for %s", rel_path)
-    return rel_path
+    filename = _attempt_filename(gen, tag, "png")
+    abs_path = paths.projects_root() / rel_dir / filename
+    _write_once(abs_path, final)
+    return {
+        "output_path": paths.assert_relative(f"{rel_dir}/{filename}"),
+        "thumbnail_path": _thumb_rel(abs_path),
+    }
+
+
+def _legacy_snapshot(gen: Generation) -> dict:
+    """Contract inputs of a row enqueued before ADR-0014 (no snapshot):
+    editing source -> init_image (+ mask), t2i input_paths -> references."""
+    params = gen.params or {}
+    inputs = [p for p in (getattr(gen, "input_paths", None) or []) if p]
+    snap: dict = {
+        "task": gen.job_type or "text_to_image",
+        # Still-image size: no resolution column; params may carry one.
+        "width": params.get("width"),
+        "height": params.get("height"),
+        "references": [],
+        "references_applied": False,
+        "init_image": None,
+        "mask": None,
+    }
+    if capabilities.canonical_task(snap["task"]) in capabilities.EDITING_TASKS:
+        snap["init_image"] = inputs[0] if inputs else None
+        snap["mask"] = params.get("mask_path") or None
+    elif inputs:
+        snap["references"] = [contract.reference_entry(p, "reference") for p in inputs]
+        snap["references_applied"] = True
+    return snap
 
 
 def _adapter_payload(db, gen: Generation) -> dict:
-    """Build the adapter payload for the job type (stub ignores extras)."""
-    root = paths.projects_root()
+    """Provider input contract payload (ADR-0014, models_lib/contract.py).
 
-    def _abs(rel: str | None) -> str | None:
-        if not rel:
-            return None
-        return str((root / rel).resolve())
+    Built from the enqueue snapshot (``params["snapshot"]``): reference
+    image paths + roles/weights, init image, mask, size. Stored paths are
+    relative; they are resolved here and must stay inside the projects root.
+    The row's seed is authoritative; a row without one (pre-ADR-0014) gets a
+    fresh seed here that the caller persists before submit.
+    """
+    root = paths.projects_root().resolve()
 
-    payload: dict = {
-        "prompt": gen.prompt_final or "",
-        "negative_prompt": gen.negative_final or "",
-        # Still-image size: the Generation model has no resolution field yet
-        # (unlike video clips), but provider templates (e.g. ComfyUI
-        # EmptyLatentImage) need concrete {width}/{height}. A future
-        # per-request resolution parameter can override via gen.params.
-        "width": (gen.params or {}).get("width") or defaults.IMAGE_DEFAULT_WIDTH,
-        "height": (gen.params or {}).get("height") or defaults.IMAGE_DEFAULT_HEIGHT,
+    def _abs(rel: str) -> str:
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise StudioError(
+                ErrorCode.VALIDATION_ERROR,
+                "Provider input path escapes the projects root.",
+                details={"path": rel},
+            ) from None
+        return str(target)
+
+    snapshot = (gen.params or {}).get(contract.SNAPSHOT_KEY)
+    if not isinstance(snapshot, dict):
+        snapshot = _legacy_snapshot(gen)
+    seed = gen.seed if gen.seed is not None else snapshot.get("seed")
+    if seed is None:
+        # Provider templates (e.g. ComfyUI KSampler) require a concrete {seed}.
+        seed = random.randrange(defaults.IMAGE_SEED_MAX_EXCLUSIVE)
+    return contract.image_payload(
+        snapshot,
+        prompt=gen.prompt_final or "",
+        negative_prompt=gen.negative_final,
+        seed=seed,
+        resolve=_abs,
+    )
+
+
+def _executed_config(gen: Generation, model: dict) -> dict:
+    """What actually runs (B7-r2 M4): the model entry the worker resolved
+    (DB overlay — the same source as the enqueue pre-check) and passes to
+    the adapter, next to the enqueue snapshot's view of it.
+
+    Policy: the current registry config executes (an old workflow is not
+    kept around to replay); a drift from the snapshot is recorded, never
+    hidden, so the snapshot plus this record explain the result.
+    """
+    snapshot = (gen.params or {}).get(contract.SNAPSHOT_KEY)
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    cfg_hash = capabilities.config_hash(model)
+    recorded = snap.get("model_config_sha256")
+    return {
+        "model_id": model.get("model_id"),
+        "model_version": model.get("version") or f"cfg-{cfg_hash[:12]}",
+        "model_config_sha256": cfg_hash,
+        "sampler": capabilities.sampler_settings(model),
+        "snapshot_model_config_sha256": recorded,
+        "config_matches_snapshot": None if recorded is None else (
+            recorded == cfg_hash and snap.get("model_id") == model.get("model_id")
+        ),
     }
-    if gen.seed is not None:
-        payload["seed"] = gen.seed
-    else:
-        # Provider templates (e.g. ComfyUI KSampler) require a concrete {seed};
-        # character master/sheet generations don't pin one, so draw a fresh
-        # random seed like enqueue_frame does for unpinned shots.
-        payload["seed"] = random.randrange(2**31)
-    if gen.job_type in ("inpaint", "upscale", "outpaint"):
-        inputs = [p for p in (gen.input_paths or [])]
-        payload["images"] = [_abs(p) for p in inputs if p]
-        mask = (gen.params or {}).get("mask_path")
-        if mask:
-            payload["mask"] = _abs(mask)
-    return payload
 
 
-def _progress(db, gen: Generation, generation_id: str, job_type: str, pct: float, stage: str) -> None:
-    gen.progress_pct = pct
-    db.flush()
+def _progress(ex, generation_id: str, job_type: str, pct: float, stage: str) -> None:
+    """Guarded progress write (also a heartbeat + cancel check), then SSE."""
+    job_execution.require(ex, {"progress_pct": pct})
     get_bridge().publish(
         CHANNEL,
         "job.progress",
         {
             "job_id": generation_id,
             "job_type": job_type,
-            "status": gen.status,
+            "status": "running",
             "progress_pct": pct,
             "stage": stage,
         },
     )
 
 
-def _notify_multishot_frame(db, gen: Generation, success: bool) -> None:
-    """Aggregate a finished coverage frame into its multishot set (P1-1).
+def _save_output(db, gen: Generation, data: bytes, tag: str) -> dict:
+    """Write this attempt's immutable output file(s); no DB writes.
 
-    Generations created by q.p1.run_multishot carry
-    params["_multishot_frame_id"]; every other generation skips this.
+    Returns {"output_path", "thumbnail_path", ["character"]}. The paths are
+    published only by the token-guarded success UPDATE (ADR-0013 B4a-fix):
+    a lost or failed attempt leaves an unreferenced orphan, never a file in
+    the way of the next attempt.
     """
-    frame_id = (gen.params or {}).get("_multishot_frame_id")
-    if not frame_id:
-        return
-    try:
-        from app.services import multishot as multishot_service
-
-        multishot_service.on_frame_finished(db, str(frame_id), success)
-    except StudioError:
-        log.warning("multishot aggregation skipped for frame %s", frame_id)
-
-
-def _update_batch_parent(db, gen: Generation) -> None:
-    """Aggregate child states into the batch parent (D-25)."""
-    if gen.parent_generation_id is None:
-        return
-    parent = db.get(Generation, gen.parent_generation_id)
-    if parent is None:
-        return
-    children = (
-        db.query(Generation)
-        .filter(Generation.parent_generation_id == parent.id)
-        .all()
-    )
-    states = [c.status for c in children]
-    if all(s in TERMINAL for s in states):
-        parent.status = "succeeded" if all(s == "succeeded" for s in states) else "failed"
-        parent.finished_at = _now()
-        parent.progress_pct = 100.0
-    elif any(s in ("queued", "running") for s in states):
-        if parent.status == "queued":
-            parent.status = "running"
-    db.flush()
-
-
-def _update_shot_status(db, gen: Generation) -> None:
-    """Recompute the shot status from its takes once none are pending.
-
-    An existing approval is preserved: new takes never demote frame_approved.
-    """
-    if gen.shot_id is None:
-        return
-    from app.core.contracts import check_enum
-    from app.models.production import Shot
-
-    shot = db.get(Shot, gen.shot_id)
-    if shot is None:
-        return
-    pending = (
-        db.query(Generation)
-        .filter(
-            Generation.shot_id == shot.id,
-            Generation.is_batch.is_(False),
-            Generation.status.in_(("queued", "running")),
-        )
-        .count()
-    )
-    if pending:
-        return
-    if shot.approved_frame_generation_id:
-        next_status = "frame_approved"
-    else:
-        succeeded = (
-            db.query(Generation)
-            .filter(
-                Generation.shot_id == shot.id,
-                Generation.is_batch.is_(False),
-                Generation.status == "succeeded",
-            )
-            .count()
-        )
-        next_status = "frame_done" if succeeded else "failed"
-    if shot.status != next_status:
-        check_enum("shot_status", next_status)
-        shot.status = next_status
-    db.flush()
+    ext = defaults.FORMAT_IMAGE_GEN
+    char_params = gen.params or {}
+    if "_character_id" in char_params:
+        return _save_character_image(gen, data, char_params, tag)
+    if "_thumbnail" in char_params:
+        # P1-9: title text is a post-processing overlay (§10.5).
+        return _save_thumbnail_image(gen, data, char_params["_thumbnail"], tag)
+    if gen.shot_id is not None:
+        return _save_shot_image(db, gen, data, ext, tag)
+    # Phase-0 location for character-less, shot-less generations.
+    rel_dir = f"projects/{gen.project_id}/frames"
+    filename = _attempt_filename(gen, tag, ext)
+    _write_once(paths.projects_root() / rel_dir / filename, data)
+    return {"output_path": paths.assert_relative(f"{rel_dir}/{filename}"),
+            "thumbnail_path": None}
 
 
 @celery_app.task(name="q.image.run_generation", bind=True, max_retries=defaults.RETRY_MAX_ATTEMPTS)
 def run_generation(self: Task, generation_id: str) -> dict:
-    """Run one image generation end to end. Returns a summary dict."""
-    with session_scope() as db:
-        gen = db.get(Generation, uuid.UUID(generation_id))
-        if gen is None:
+    """Run one image generation end to end. Returns a summary dict.
+
+    Execution ownership (ADR-0013): the row is claimed queued -> running in
+    its own transaction; every later write is guarded by the execution
+    token. A delivery that cannot claim (terminal, canceled, owned by a live
+    execution) is a no-op — the provider is never called (P20).
+    """
+    gid = uuid.UUID(generation_id)
+    ex = job_execution.claim(Generation, gid)
+    if ex is None:
+        status = job_execution.current_status(Generation, gid)
+        if status is None:
             raise StudioError(ErrorCode.NOT_FOUND, "Generation not found.", details={"job_id": generation_id})
+        log.info("generation not claimable (status=%s), no-op job_id=%s", status, generation_id)
+        return {"generation_id": generation_id, "status": status}
 
-        # Canceled while queued: never run the provider call.
-        if gen.status == "canceled":
-            log.info("generation canceled before run job_id=%s", generation_id)
-            return {"generation_id": generation_id, "status": "canceled"}
+    with session_scope() as db:
+        job_type = db.get(Generation, gid).job_type or "text_to_image"
+    phase = job_execution.PHASE_PRE
+    try:
+        with job_execution.keepalive(ex):
+            try:
+                _progress(ex, generation_id, job_type, 5.0, "routing")
+                with session_scope() as db:
+                    gen = db.get(Generation, gid)
+                    routed = router.route(
+                        task=job_type,
+                        modality="image",
+                        explicit_model_id=gen.model_id,
+                        db=db,
+                    )
+                    payload = _adapter_payload(db, gen)
+                    drawn_seed = payload["seed"] if gen.seed is None else None
+                    # One config source for pre-check, record and adapter.
+                    model = registry.get_model(routed["model_id"], db)
+                    executed = _executed_config(gen, model)
+                if executed["config_matches_snapshot"] is False:
+                    log.warning(
+                        "generation %s: model config changed since enqueue "
+                        "(snapshot %s, executing %s)", generation_id,
+                        str(executed["snapshot_model_config_sha256"])[:12],
+                        executed["model_config_sha256"][:12],
+                    )
 
-        job_type = gen.job_type or "text_to_image"
-        attempt = GenerationAttempt(
-            generation_id=gen.id,
-            attempt_no=gen.retry_count + 1,
-            model_id=gen.model_id or "",
-            started_at=_now(),
+                def _record_executed(db, row: Generation) -> None:
+                    row.params = {**(row.params or {}), "executed": executed}
+
+                # Persist a worker-drawn seed and the executed config before
+                # submit (reproducible / auditable, ADR-0014 B7-r2).
+                job_execution.require(
+                    ex, {"seed": drawn_seed} if drawn_seed is not None else {},
+                    after=_record_executed,
+                )
+                adapter = registry.get_adapter(routed["adapter"])
+                ex.model_id = routed["model_id"]
+
+                phase = job_execution.PHASE_SUBMITTING
+                with registry.pinned_model(model):
+                    data = job_execution.submit_poll_fetch(
+                        ex, adapter, routed["model_id"], payload,
+                        progress=lambda pct, stage: _progress(ex, generation_id, job_type, pct, stage),
+                    )
+                phase = job_execution.PHASE_LOCAL
+                # Only a decodable image is ever published (B7-r2 M3).
+                # (No provider id in the message: provider metadata is quoted
+                # only through the adapter's redaction gate, B7-r3 M1.)
+                media_check.check_image_decodes(data, what="Provider result")
+                # Per-attempt immutable file(s) first, outside any write
+                # transaction (D8 pattern): the token-guarded UPDATE below is
+                # the only publish. A lost/failed attempt leaves an orphan.
+                job_execution.require(ex, {})
+                with session_scope() as db:
+                    saved = _save_output(db, db.get(Generation, gid), data, ex.token.hex[:8])
+                result: dict = {}
+
+                def _publish_success(db, gen: Generation) -> None:
+                    # Same transaction as the guarded success UPDATE: paths,
+                    # reference rows and dependents land only for the owner.
+                    gen.output_path = saved["output_path"]
+                    if saved.get("thumbnail_path"):
+                        gen.output_thumbnail_path = saved["thumbnail_path"]
+                    if saved.get("character"):
+                        from app.services.character_pipeline import reference_for_job
+
+                        reference_for_job(db, gen, saved["output_path"])
+                    job_execution.finish_attempt(db, ex)
+                    db.flush()
+                    job_execution.on_generation_terminal(db, gen, success=True)
+                    result["output_path"] = saved["output_path"]
+
+                done = job_execution.guarded_update(
+                    ex,
+                    {
+                        "status": "succeeded",
+                        "progress_pct": 100.0,
+                        "model_id": routed["model_id"],
+                        "actual_cost_usd": Generation.estimated_cost_usd,
+                        "finished_at": _now(),
+                        "error_code": None,
+                        "error_message": None,
+                    },
+                    after=_publish_success,
+                )
+                if not done:
+                    raise job_execution.OwnershipLost(generation_id)
+            except (job_execution.OwnershipLost, job_execution.JobFailure):
+                raise
+            except Exception as exc:  # noqa: BLE001 - persisted as a failure below
+                raise job_execution.JobFailure(phase, job_execution.as_studio_error(exc)) from exc
+    except job_execution.OwnershipLost:
+        log.info("generation lost ownership (canceled/superseded) job_id=%s", generation_id)
+        return {"generation_id": generation_id, "status": "lost"}
+    except job_execution.JobFailure as failure:
+        return _handle_failure(self, ex, failure, generation_id, job_type)
+
+    get_bridge().publish(
+        CHANNEL,
+        "job.completed",
+        {
+            "job_id": generation_id,
+            "job_type": job_type,
+            "status": "succeeded",
+            "output_path": result["output_path"],
+            "output_count": 1,
+        },
+    )
+    log.info("generation succeeded job_id=%s model=%s", generation_id, routed["model_id"])
+    return {"generation_id": generation_id, "status": "succeeded", "output_path": result["output_path"]}
+
+
+def _handle_failure(self: Task, ex, failure, generation_id: str, job_type: str) -> dict:
+    """Commit the failure first, then SSE / retry / raise (F02/F03)."""
+
+    def _after_fail(db, gen: Generation, code: str, message: str) -> None:
+        job_execution.on_generation_terminal(db, gen, success=False)
+
+    outcome, code = job_execution.record_failure(ex, failure, after_fail=_after_fail)
+    exc = failure.error
+    if outcome == "lost":
+        log.info("generation failure not recorded (ownership lost) job_id=%s", generation_id)
+        return {"generation_id": generation_id, "status": "lost"}
+    if outcome == "retry":
+        log.warning(
+            "generation failed, retrying job_id=%s attempt=%s code=%s",
+            generation_id, ex.retry_count + 1, code,
         )
-        db.add(attempt)
-        gen.status = "running"
-        gen.started_at = gen.started_at or _now()
-        db.flush()
-
-        try:
-            _progress(db, gen, generation_id, job_type, 5.0, "routing")
-            routed = router.route(
-                task=job_type,
-                modality="image",
-                explicit_model_id=gen.model_id,
-                db=db,
-            )
-            adapter = registry.get_adapter(routed["adapter"])
-            attempt.model_id = routed["model_id"]
-
-            _progress(db, gen, generation_id, job_type, 20.0, "submitted")
-            provider_job_id = adapter.submit(routed["model_id"], _adapter_payload(db, gen))
-            attempt.provider_job_id = provider_job_id
-
-            def _on_poll(status: JobStatus) -> None:
-                _progress(
-                    db, gen, generation_id, job_type,
-                    20.0 + status.progress_pct * 0.5, status.stage or "polling",
-                )
-
-            final = poll_until_done(adapter, provider_job_id, on_progress=_on_poll)
-            if final.state != "succeeded":
-                raise StudioError(
-                    final.error_code or ErrorCode.PROVIDER_ERROR,
-                    final.error_message or "Provider reported failure.",
-                )
-
-            _progress(db, gen, generation_id, job_type, 90.0, "saving")
-            data = adapter.fetch_result(provider_job_id)
-            ext = defaults.FORMAT_IMAGE_GEN
-            char_params = gen.params or {}
-            if "_character_id" in char_params:
-                rel_path = _save_character_image(db, gen, data, char_params, ext)
-            elif "_thumbnail" in char_params:
-                # P1-9: title text is a post-processing overlay (§10.5).
-                rel_path = _save_thumbnail_image(db, gen, data, char_params["_thumbnail"], ext)
-            elif gen.shot_id is not None:
-                rel_path = _save_shot_image(db, gen, data, ext)
-            else:
-                # Phase-0 location for character-less, shot-less generations.
-                rel_dir = f"projects/{gen.project_id}/frames"
-                filename = naming.frame_filename(str(gen.id), 0, ext)
-                abs_path = paths.ensure_parent(paths.projects_root() / rel_dir / filename)
-                immutability.write_new(abs_path, data)
-                rel_path = paths.assert_relative(f"{rel_dir}/{filename}")
-
-            gen.status = "succeeded"
-            gen.progress_pct = 100.0
-            gen.output_path = rel_path
-            gen.model_id = routed["model_id"]
-            gen.actual_cost_usd = gen.estimated_cost_usd
-            gen.finished_at = _now()
-            gen.error_code = None
-            gen.error_message = None
-            attempt.finished_at = _now()
-            db.flush()
-
-            _update_batch_parent(db, gen)
-            _update_shot_status(db, gen)
-            _notify_multishot_frame(db, gen, success=True)
-
-            get_bridge().publish(
-                CHANNEL,
-                "job.completed",
-                {
-                    "job_id": generation_id,
-                    "job_type": job_type,
-                    "status": "succeeded",
-                    "output_path": rel_path,
-                    "output_count": 1,
-                },
-            )
-            log.info("generation succeeded job_id=%s model=%s", generation_id, routed["model_id"])
-            return {"generation_id": generation_id, "status": "succeeded", "output_path": rel_path}
-
-        except StudioError as exc:
-            attempt.finished_at = _now()
-            attempt.error_code = exc.code
-            attempt.error_message = exc.message
-            if exc.retryable and gen.retry_count < defaults.RETRY_MAX_ATTEMPTS:
-                gen.retry_count += 1
-                gen.status = "queued"
-                gen.error_code = exc.code
-                gen.error_message = exc.message
-                db.flush()
-                countdown = (
-                    defaults.RETRY_BACKOFF_BASE_SEC * (2 ** (gen.retry_count - 1))
-                    + random.uniform(0, defaults.RETRY_JITTER_SEC)
-                )
-                log.warning(
-                    "generation failed, retrying job_id=%s attempt=%s code=%s",
-                    generation_id, gen.retry_count, exc.code,
-                )
-                raise self.retry(exc=exc, countdown=countdown)
-            gen.status = "failed"
-            gen.finished_at = _now()
-            gen.error_code = exc.code
-            gen.error_message = exc.message
-            db.flush()
-
-            _update_batch_parent(db, gen)
-            _update_shot_status(db, gen)
-            _notify_multishot_frame(db, gen, success=False)
-
-            get_bridge().publish(
-                CHANNEL,
-                "job.failed",
-                {
-                    "job_id": generation_id,
-                    "job_type": job_type,
-                    "error_code": exc.code,
-                    "error_message": exc.message,
-            "retryable": exc.retryable,
-                    "retry_count": gen.retry_count,
-                    "max_retries": defaults.RETRY_MAX_ATTEMPTS,
-                },
-            )
-            log.warning("generation failed job_id=%s code=%s", generation_id, exc.code)
-            raise
+        raise self.retry(exc=exc, countdown=job_execution.retry_countdown(ex.retry_count + 1))
+    get_bridge().publish(
+        CHANNEL,
+        "job.failed",
+        {
+            "job_id": generation_id,
+            "job_type": job_type,
+            "error_code": code,
+            "error_message": exc.message,
+            "retryable": False,
+            "retry_count": ex.retry_count,
+            "max_retries": defaults.RETRY_MAX_ATTEMPTS,
+        },
+    )
+    log.warning("generation failed job_id=%s code=%s", generation_id, code)
+    raise exc
 
 
 # Register the eager-capable dispatcher so services can enqueue without

@@ -292,6 +292,15 @@ export default function TimelinePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventSeq]);
 
+  // SSE reconnected: a render may have finished while events were missed and
+  // nothing tracked it, so reload the active timeline unconditionally.
+  const resyncSeq = useWorkspaceStore((s) => s.resyncSeq);
+  useEffect(() => {
+    if (!activeId || resyncSeq === 0) return;
+    void loadTimeline(activeId).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resyncSeq]);
+
   /** Create a new timeline and switch to it (projects can hold several). */
   const createTimeline = async () => {
     if (creating) return;

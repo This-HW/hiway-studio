@@ -112,6 +112,7 @@ def _upload_wav(client: TestClient, pid: str, dst_name: str = "sample.wav") -> s
     return r.json()["asset_id"]
 
 
+@pytest.mark.needs_ffmpeg
 def test_dialogue_tts_end_to_end(api_env):
     client, tmp_path = api_env
     pid, shot_id, cid = _project_scene_shot_character(client)
@@ -169,6 +170,7 @@ def test_dialogue_emotion_weights_validation(api_env):
     assert r.status_code in (400, 422), r.text
 
 
+@pytest.mark.needs_ffmpeg
 def test_voice_clone_and_dialogue_uses_voice(api_env):
     client, _ = api_env
     pid, shot_id, cid = _project_scene_shot_character(client)
@@ -211,6 +213,7 @@ def test_voice_clone_rejects_non_audio(api_env):
     assert r.status_code in (400, 422), r.text
 
 
+@pytest.mark.needs_ffmpeg
 def test_lipsync_service_within_and_beyond_band(tmp_path):
     from app.services import lipsync
 
@@ -239,6 +242,7 @@ def test_lipsync_service_within_and_beyond_band(tmp_path):
     assert res3["warning"] is not None
 
 
+@pytest.mark.needs_ffmpeg
 def test_dialogue_worker_applies_lipsync(api_env):
     client, tmp_path = api_env
     _, shot_id, cid = _project_scene_shot_character(client)

@@ -5,8 +5,16 @@ import { useEffect } from "react";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import { Modal } from "@/components/Modal";
 import { ToastStack } from "@/components/Toast";
+import { resolveFileUrl } from "@/lib/files";
 import { ASPECT_RATIOS, formatMonthlyCost } from "@/lib/format";
 import { useProjectsStore } from "@/stores/projects";
+
+/** Card thumbnail: the API's relative frame path served via /files (P0_SCREENS §1). */
+function ProjectThumb({ path }: { path: string | null }) {
+  const url = resolveFileUrl(path);
+  if (url) return <img src={url} alt="" className="thumb" />;
+  return <div className="placeholder-box">썸네일 없음</div>;
+}
 
 export default function ProjectsPage() {
   const router = useRouter();
@@ -77,11 +85,7 @@ export default function ProjectsPage() {
               if (e.key === "Enter") router.push(`/projects/${p.id}/story`);
             }}
           >
-            {p.thumbnail_url ? (
-              <img src={p.thumbnail_url} alt="" className="thumb" />
-            ) : (
-              <div className="placeholder-box">썸네일 없음</div>
-            )}
+            <ProjectThumb path={p.thumbnail} />
             <h3 className="card-title" style={{ marginTop: 10 }}>
               {p.title}
             </h3>

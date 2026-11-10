@@ -1,0 +1,15 @@
+# Allowlist: the build context is the repo root, which may hold large
+# gitignored dirs (projects/, library/, node_modules, .next).
+*
+!services/api
+!packages/contracts
+!infra/seeds
+infra/seeds/local
+!tools
+
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.egg-info
+**/.venv
+**/.env

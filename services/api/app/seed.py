@@ -7,8 +7,7 @@ without tripping the dependency-direction lint (neither may import the other).
 """
 from __future__ import annotations
 
-from pathlib import Path
-
+from app.core.contracts import seeds_dir
 from app.db.session import session_scope
 from app.models_lib.seed import apply_seed as apply_model_seed
 from app.services.camera import ensure_builtin_camera_presets
@@ -20,7 +19,7 @@ from app.services.style_kit import seed_category_packs
 def main() -> None:
     n = apply_model_seed()
     print(f"seed: upserted {n} models (idempotent)")
-    seed_dir = Path(__file__).resolve().parents[3] / "infra" / "seeds" / "category_packs"
+    seed_dir = seeds_dir() / "category_packs"
     with session_scope() as db:
         m = seed_category_packs(db, seed_dir)
         p = ensure_builtin_presets(db)

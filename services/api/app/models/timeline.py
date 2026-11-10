@@ -35,7 +35,9 @@ class Timeline(Base):
     output_preset_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("export_presets.id"), nullable=True
     )
-    # Relative path only, e.g. "projects/<uuid>/timelines/<uuid>/output.mp4".
+    # Relative path of the PUBLISHED render (plan D8): an immutable
+    # per-attempt file "projects/<uuid>/timelines/<uuid>/output_<token8>.mp4".
+    # Rows rendered before B4b keep their ".../output.mp4" (still served).
     output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Contract enum render_status: draft | rendering | done | failed.
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft", index=True)
@@ -46,6 +48,21 @@ class Timeline(Base):
     content_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Render execution ownership (ADR-0013, plan D4/D8). request_render issues
+    # exec_token with the 'rendering' claim; the worker marks the start with
+    # heartbeat_at (NULL = requested, not started) and extends the lease.
+    # Every later write (heartbeat, publish, failure) is conditional on
+    # id + exec_token + status='rendering'.
+    exec_token: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Metadata of the published output: exec_token, preset, content_version,
+    # postflight results and anything left unverified (e.g. OCR missing).
+    render_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

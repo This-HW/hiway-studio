@@ -10,7 +10,7 @@
 
 | 관점 | 판정 | 근거 |
 |---|---|---|
-| 아키텍처 | ✅ 적합 | 로컬 우선, 인증 없음, 결제 없음, docker-compose 단일 배포. SaaS 전환 압력이 구조에 없음 |
+| 아키텍처 | ✅ 적합 | 로컬 우선, 인증 없음, 결제 없음, docker-compose 단일 배포. SaaS 전환 압력이 구조에 없음. 인증이 없으므로 compose는 API를 `127.0.0.1`에만 게시한다(`tools/check_compose_loopback.py`, CI G7) |
 | 실행 모델 | ✅ 적합 | 사용자=운영자 1인. "내 머신에서 내 API 키로"가 기본 사용법이라 계정·과금 분쟁 소지가 없음 |
 | 확장 표면 | ✅ 적합 | Provider Adapter가 명확한 확장점. "새 모델 붙이기"가 기여의 단위가 되기 좋음 |
 | 데모 가능성 | ✅ 적합 | stub 어댑터가 이미 설계에 있음 → API 키 없이 `make demo`로 전체 플로우 체험 가능 |
@@ -47,16 +47,16 @@ marketing은 업체별 지식·설정이 코드에 준하는 자산이지만, �
 | GPL 계열 | 비권장. 아래 주의사항과 충돌 |
 
 **주의 — 의존성 라이선스:**
-- **ComfyUI는 GPL-3.0.** 우리 어댑터가 별도 프로세스에 REST/WebSocket으로 붙으므로 "결합"이 아니라 "집합"으로 본다. ComfyUI 코드를 레포에 넣거나 임포트하지 않는 한 MIT 유지 가능. `docker-compose`에서 별도 서비스로만 참조한다.
-- **ffmpeg:** 빌드에 따라 LGPL/GPL. 문서에 "LGPL 빌드 사용"을 명시하거나, 사용자에게 선택을 위임한다.
-- PaddleOCR(Apache-2.0), Next.js·FastAPI(MIT)는 문제없음.
+- **ComfyUI는 GPL-3.0.** 우리 어댑터(seed 기반 `http_polling`)가 별도 프로세스에 HTTP REST로 붙으므로 "결합"이 아니라 "집합"으로 본다. ComfyUI 코드를 레포에 넣거나 임포트하지 않는 한 MIT 유지 가능. `docker-compose.yml`에도 넣지 않고 `COMFYUI_URL`로만 참조한다.
+- **ffmpeg:** 빌드에 따라 LGPL/GPL. 문서에 "LGPL 빌드 사용"을 명시하거나, 사용자에게 선택을 위임한다. (현재 API 이미지는 Debian 패키지 `ffmpeg`를 설치한다.)
+- PaddleOCR(Apache-2.0), Next.js·FastAPI(MIT)는 문제없음. API 이미지에는 `fonts-noto-cjk`(SIL OFL 1.1)와 빌드 시 받는 PP-OCR 한국어 인식 모델(`docs/licenses.md` Unit B)이 들어간다. 폰트 고지는 `docs/licenses.md`에 있다. 이미지의 ffmpeg는 Debian 빌드(GPL 옵션 포함)이므로, 이미지를 재배포하면 GPL 조건을 따르거나 LGPL 빌드로 바꾼다.
 - 모델 가중치(LoRA 등)는 사용자가 직접 구하는 것으로. 레포에 가중치를 포함하지 않는다.
 
 ## 4. 공개 전 체크리스트
 
 - [ ] `.env.example` 완성 (모든 변수 문서화, 값 없음)
 - [ ] 시크릿 스캔 (히스토리에 키가 들어간 적 없는지)
-- [ ] `make demo` 동작 확인 (stub 어댑터로 키 없이 전체 플로우)
+- [ ] `make demo` 동작 확인 (stub 어댑터로 키 없이 전체 플로우). CI(`.github/workflows/ci.yml`)도 키·유료 provider 없이 stub으로 돈다
 - [ ] README: 5분 퀵스타트 (docker-compose up → 데모 프로젝트 생성까지)
 - [ ] LICENSE 파일 (MIT 권장) + 의존성 라이선스 고지 (`docs/licenses.md`)
 - [ ] `projects/`, `library/`, `*.env`, `infra/backups/` gitignore 확인

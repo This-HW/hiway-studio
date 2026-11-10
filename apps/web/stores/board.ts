@@ -23,6 +23,26 @@ import type {
   ShotReference,
 } from "@/lib/types";
 import { toast } from "./toast";
+import { useWorkspaceStore } from "./workspace";
+
+/** Register HTTP-accepted takes so a reconnect resync can settle them even
+ * when no SSE event for them arrived (review B6R2-M1). Called AFTER the
+ * pending registry is written: if a take's terminal event already arrived,
+ * track() bumps eventSeq and the screen's settle effect sees the pending
+ * entry (review B6R3-M1). */
+function trackTakes(ids: string[], reconnectsAtRequest: number): void {
+  useWorkspaceStore
+    .getState()
+    .track(
+      ids.map((job_id) => ({ job_id, job_type: "text_to_image" })),
+      { reconnectsAtRequest }
+    );
+}
+
+/** Reconnect marker captured before a job-creating request (B6R3-R2-M1). */
+function reconnectMarker(): number {
+  return useWorkspaceStore.getState().reconnects;
+}
 
 interface BoardState {
   projectId: string | null;
@@ -266,6 +286,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     const key = `gen-${shotId}-${crypto.randomUUID()}`;
     set({ busy: { ...get().busy, [shotId]: true } });
     try {
+      const marker = reconnectMarker();
       const res = await apiPost<JobAccepted>(
         `/api/v1/shots/${shotId}/frame`,
         {
@@ -279,6 +300,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         pendingTakes: { ...get().pendingTakes, [shotId]: takeIds },
         busy: { ...get().busy, [shotId]: false },
       });
+      trackTakes(takeIds, marker);
       toast(
         `프레임 생성 시작 (예상 $${Number(res.estimated_cost_usd).toFixed(4)})`,
       );
@@ -292,6 +314,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     const key = `retake-${shotId}-${crypto.randomUUID()}`;
     set({ busy: { ...get().busy, [shotId]: true } });
     try {
+      const marker = reconnectMarker();
       const res = await apiPost<JobAccepted>(
         `/api/v1/shots/${shotId}/retake`,
         { batch_size: 2 },
@@ -302,6 +325,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         pendingTakes: { ...get().pendingTakes, [shotId]: takeIds },
         busy: { ...get().busy, [shotId]: false },
       });
+      trackTakes(takeIds, marker);
       toast("리테이크 시작");
     } catch (e) {
       set({ busy: { ...get().busy, [shotId]: false } });
@@ -312,12 +336,14 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   inpaint: async (shotId, generationId, maskPath, prompt) => {
     const key = `inpaint-${shotId}-${crypto.randomUUID()}`;
     try {
+      const marker = reconnectMarker();
       const res = await apiPost<JobAccepted>(
         `/api/v1/shots/${shotId}/inpaint`,
         { generation_id: generationId, mask_path: maskPath, prompt },
         { idempotencyKey: key },
       );
       set({ pendingTakes: { ...get().pendingTakes, [shotId]: [res.job_id] } });
+      trackTakes([res.job_id], marker);
       toast("인페인트 시작");
     } catch (e) {
       toast(errMsg(e, "인페인트에 실패했습니다."), { kind: "error" });
@@ -327,12 +353,14 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   upscale: async (shotId, generationId) => {
     const key = `upscale-${shotId}-${crypto.randomUUID()}`;
     try {
+      const marker = reconnectMarker();
       const res = await apiPost<JobAccepted>(
         `/api/v1/shots/${shotId}/upscale`,
         { generation_id: generationId },
         { idempotencyKey: key },
       );
       set({ pendingTakes: { ...get().pendingTakes, [shotId]: [res.job_id] } });
+      trackTakes([res.job_id], marker);
       toast("업스케일 시작");
     } catch (e) {
       toast(errMsg(e, "업스케일에 실패했습니다."), { kind: "error" });
@@ -342,12 +370,14 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   outpaint: async (shotId, generationId, prompt) => {
     const key = `outpaint-${shotId}-${crypto.randomUUID()}`;
     try {
+      const marker = reconnectMarker();
       const res = await apiPost<JobAccepted>(
         `/api/v1/shots/${shotId}/outpaint`,
         { generation_id: generationId, prompt },
         { idempotencyKey: key },
       );
       set({ pendingTakes: { ...get().pendingTakes, [shotId]: [res.job_id] } });
+      trackTakes([res.job_id], marker);
       toast("아웃페인트 시작");
     } catch (e) {
       toast(errMsg(e, "아웃페인트에 실패했습니다."), { kind: "error" });
@@ -378,7 +408,8 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   removeReference: async (shotId, refId) => {
     try {
-      await apiDelete(`/api/v1/references/${refId}`);
+      // ADR-0012: shot references are deleted under their shot.
+      await apiDelete(`/api/v1/shots/${shotId}/references/${refId}`);
       await get().loadShotDetail(shotId);
     } catch (e) {
       toast(errMsg(e, "레퍼런스 삭제에 실패했습니다."), { kind: "error" });

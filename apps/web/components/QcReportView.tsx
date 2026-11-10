@@ -9,6 +9,7 @@ const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
   warn: { label: "경고", cls: "" },
   fail: { label: "실패", cls: "red" },
   pending: { label: "검사 중…", cls: "" },
+  not_applicable: { label: "미적용", cls: "" },
 };
 
 const CHECK_LABELS: Record<string, string> = {
@@ -51,7 +52,10 @@ export function QcReportView({ report }: { report: QCReport }) {
           </thead>
           <tbody>
             {report.checks.map((c) => {
-              const st = STATUS_STYLE[c.status] ?? STATUS_STYLE.pending;
+              const st =
+                c.applicable === false
+                  ? STATUS_STYLE.not_applicable
+                  : STATUS_STYLE[c.status] ?? STATUS_STYLE.pending;
               return (
                 <tr key={c.code} style={{ borderTop: "1px solid var(--border)" }}>
                   <td style={{ padding: "4px 6px" }}>

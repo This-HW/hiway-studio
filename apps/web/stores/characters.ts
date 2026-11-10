@@ -23,6 +23,7 @@ import type {
 import { koreanErrorMessage } from "@/lib/format";
 import { ApiError } from "@/lib/errors";
 import { toast } from "./toast";
+import { useWorkspaceStore } from "./workspace";
 
 export type DetailTab = "references" | "wardrobe";
 
@@ -97,6 +98,14 @@ interface CharactersState {
   setMasterPrompt: (v: string) => void;
   generateMaster: () => Promise<string | null>;
   markMasterJobDone: (characterId: string) => void;
+  /**
+   * Remove every pending master job that reached a terminal state
+   * (completed / failed / canceled) and report them, so the screen can toast
+   * and refresh (review B6R3-R2-M2: canceled used to stay pending forever).
+   */
+  settleMasterJobs: (
+    jobs: Record<string, { status: string; error_code?: string }>
+  ) => { characterId: string; status: string; errorCode?: string }[];
   uploadMaster: (file: File) => Promise<void>;
 
   togglePrimary: (ref: Reference) => Promise<void>;
@@ -338,12 +347,15 @@ export const useCharactersStore = create<CharactersState>((set, get) => ({
     if (!selectedId || get().masterGenerating) return null;
     set({ masterGenerating: true });
     try {
+      const marker = useWorkspaceStore.getState().reconnects;
       const res = await apiPost<JobStarted>(
         `/api/v1/characters/${selectedId}/master`,
         {
           prompt: masterPrompt.trim() || undefined,
           model_id: masterModelId || undefined,
-        }
+        },
+        // One key per click: a double submit replays the same job (D2).
+        { idempotencyKey: `master-${selectedId}-${crypto.randomUUID()}` }
       );
       set((s) => ({
         masterGenerating: false,
@@ -352,6 +364,12 @@ export const useCharactersStore = create<CharactersState>((set, get) => ({
           [selectedId]: res.job_id,
         },
       }));
+      // After the pending entry exists (review B6R3-M1).
+      useWorkspaceStore
+        .getState()
+        .track([{ job_id: res.job_id, job_type: "text_to_image" }], {
+          reconnectsAtRequest: marker,
+        });
       toast("마스터 초상 생성을 시작했습니다. 완료되면 썸네일이 갱신됩니다.");
       return res.job_id;
     } catch (e) {
@@ -371,6 +389,25 @@ export const useCharactersStore = create<CharactersState>((set, get) => ({
       delete next[characterId];
       return { masterJobByCharacter: next };
     }),
+
+  settleMasterJobs: (jobs) => {
+    const settled: { characterId: string; status: string; errorCode?: string }[] = [];
+    for (const [characterId, jobId] of Object.entries(get().masterJobByCharacter)) {
+      const job = jobs[jobId];
+      if (!job) continue;
+      if (job.status === "completed" || job.status === "failed" || job.status === "canceled") {
+        settled.push({ characterId, status: job.status, errorCode: job.error_code });
+      }
+    }
+    if (settled.length > 0) {
+      set((s) => {
+        const next = { ...s.masterJobByCharacter };
+        for (const x of settled) delete next[x.characterId];
+        return { masterJobByCharacter: next };
+      });
+    }
+    return settled;
+  },
 
   uploadMaster: async (file) => {
     const { projectId, selectedId } = get();

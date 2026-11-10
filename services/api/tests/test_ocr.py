@@ -7,7 +7,6 @@ engine errors) use monkeypatched recognize() for determinism.
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -16,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
+from app.core import defaults
 from app.media import ocr
 from app.services.qc_orchestrator import (
     QCContext,
@@ -23,22 +23,26 @@ from app.services.qc_orchestrator import (
     _check_text_ocr_match,
 )
 
-CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-needs_cjk = pytest.mark.skipif(
-    not Path(CJK_FONT).exists(), reason="Noto Sans CJK font not available"
-)
-needs_ffmpeg = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="ffmpeg not available"
-)
+# External-tool gating lives in conftest (markers needs_ffmpeg / needs_cjk_font):
+# skipped when the tool is missing, a hard failure under REQUIRE_MEDIA_TOOLS=1.
+needs_cjk = pytest.mark.needs_cjk_font
+needs_ffmpeg = pytest.mark.needs_ffmpeg
 needs_engine = pytest.mark.skipif(not ocr.AVAILABLE, reason="OCR engine not installed")
 
 
+def _scalable_font(size: int):
+    """Scalable font that exists on this host (never the tiny bitmap default)."""
+    for path in (*defaults.CJK_FONT_CANDIDATES, *defaults.LATIN_FONT_CANDIDATES):
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default(size=size)
+
+
 def _text_image(path: Path, lines: list[str], font_size: int = 48) -> Path:
-    font = (
-        ImageFont.truetype(CJK_FONT, font_size)
-        if Path(CJK_FONT).exists()
-        else ImageFont.load_default()
-    )
+    font = _scalable_font(font_size)
     img = Image.new("RGB", (900, 120 * len(lines) + 60), "white")
     d = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
@@ -162,30 +166,74 @@ def test_text_ocr_match_no_intended_text_pass():
     assert r.status == "pass" and not r.stub
 
 
-def test_text_ocr_match_engine_absent_is_stub(monkeypatch):
+def test_text_ocr_match_engine_absent_is_unverified_not_pass(monkeypatch):
+    # Replaces the old "engine absent -> pass (stub)" expectation (plan D5 /
+    # review WA-H1): an applicable check that could not run is unverified.
     monkeypatch.setattr(ocr, "AVAILABLE", False)
-    r = _check_text_ocr_match(_ctx([_shot("Hello")], {}))
-    assert r.status == "pass" and r.stub is True
+    shot = _shot("Hello")
+    r = _check_text_ocr_match(_ctx([shot], [(shot, "/tmp/fake.png")]))
+    assert r.status == "warn" and r.stub is True, r
+    assert r.applicable is True
+    assert "not installed" in r.details
 
 
-@needs_engine
-def test_text_ocr_match_ocr_error_does_not_fail_gate(monkeypatch, en_image):
+def test_text_ocr_match_ocr_error_fails_required_check(monkeypatch):
+    # Replaces the old "OCR error -> pass" expectation (plan D5 / WA-H1):
+    # text_ocr_match is a required check, so an OCR runtime error is fail.
     def boom(path):
         raise ocr.OCRError("simulated engine failure")
 
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
     monkeypatch.setattr(ocr, "recognize", boom)
     shot = _shot("Hello World")
-    r = _check_text_ocr_match(_ctx([shot], [(shot, en_image)]))
-    assert r.status == "pass", r  # infra failure is not a text mismatch
-    assert "no verifiable media" in r.details or "ocr error" in r.details
+    r = _check_text_ocr_match(_ctx([shot], [(shot, "/tmp/fake.png")]))
+    assert r.status == "fail", r
+    assert "ocr error" in r.details and "simulated engine failure" in r.details
+
+
+def test_text_ocr_match_mixed_success_and_error_is_not_pass(monkeypatch):
+    ok, bad = _shot("Hello World"), _shot("Hello World")
+
+    def recognize(path):
+        if path.endswith("bad.png"):
+            raise ocr.OCRError("simulated engine failure")
+        return [{"text": "Hello World", "confidence": 0.99, "at_sec": 0.0}]
+
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", recognize)
+    r = _check_text_ocr_match(
+        _ctx([ok, bad], [(ok, "/tmp/ok.png"), (bad, "/tmp/bad.png")]))
+    assert r.status == "fail", r
+    assert str(bad.id) in r.details
+
+
+def test_text_ocr_match_mixed_verified_and_no_media_is_not_pass(monkeypatch):
+    ok, orphan = _shot("Hello World"), _shot("Hello World")
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", lambda path: [
+        {"text": "Hello World", "confidence": 0.99, "at_sec": 0.0}])
+    r = _check_text_ocr_match(_ctx([ok, orphan], [(ok, "/tmp/ok.png")]))
+    assert r.status == "warn", r
+    assert "unverified: no media" in r.details
+
+
+def test_text_ocr_match_all_verified_passes(monkeypatch):
+    a, b = _shot("Hello World"), _shot("Hello World")
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", lambda path: [
+        {"text": "Hello World", "confidence": 0.99, "at_sec": 0.0}])
+    r = _check_text_ocr_match(_ctx([a, b], [(a, "/tmp/a.png"), (b, "/tmp/b.png")]))
+    assert r.status == "pass" and not r.stub, r
 
 
 @needs_engine
 def test_text_ocr_match_shot_without_media_is_unverifiable():
     shot = _shot("Hello World")
     r = _check_text_ocr_match(_ctx([shot], []))
-    assert r.status == "pass", r
-    assert "no verifiable media" in r.details
+    # Declared on-screen text that cannot be checked must not pass silently
+    # (plan D5 / audit C10): it is reported as unverified.
+    assert r.status == "warn", r
+    assert "unverified: no media" in r.details
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +248,56 @@ def test_text_artifact_pass_on_clean_image(blank_image):
     assert r.status == "pass" and not r.stub, r
 
 
-def test_text_artifact_engine_absent_is_stub(monkeypatch):
+def test_text_artifact_engine_absent_is_unverified_not_pass(monkeypatch):
+    # Replaces the old "engine absent -> pass (stub)" expectation (plan D5 /
+    # review WA-H1): there are frames to scan, so the scan is unverified.
+    monkeypatch.setattr(ocr, "AVAILABLE", False)
+    shot = _shot(None)
+    r = _check_text_artifact(_ctx([shot], [(shot, "/tmp/fake.png")]))
+    assert r.status == "warn" and r.stub is True, r
+    assert r.applicable is True
+    assert "not installed" in r.details
+
+
+def test_text_artifact_engine_absent_without_media_is_not_pass(monkeypatch):
     monkeypatch.setattr(ocr, "AVAILABLE", False)
     r = _check_text_artifact(_ctx([_shot(None)], {}))
-    assert r.status == "pass" and r.stub is True
+    assert r.status == "warn", r
+
+
+def test_text_artifact_ocr_error_fails_required_check(monkeypatch):
+    def boom(path):
+        raise ocr.OCRError("simulated engine failure")
+
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", boom)
+    shot = _shot(None)
+    r = _check_text_artifact(_ctx([shot], [(shot, "/tmp/fake.png")]))
+    assert r.status == "fail", r
+    assert "ocr error" in r.details
+
+
+def test_text_artifact_mixed_scan_and_error_is_not_pass(monkeypatch):
+    ok, bad = _shot(None), _shot(None)
+
+    def recognize(path):
+        if path.endswith("bad.png"):
+            raise ocr.OCRError("simulated engine failure")
+        return [{"text": "clean", "confidence": 0.99, "at_sec": 0.0}]
+
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", recognize)
+    r = _check_text_artifact(
+        _ctx([ok, bad], [(ok, "/tmp/ok.png"), (bad, "/tmp/bad.png")]))
+    assert r.status == "fail", r
+
+
+def test_text_artifact_zero_scanned_while_shots_exist_is_not_pass(monkeypatch):
+    monkeypatch.setattr(ocr, "AVAILABLE", True)
+    monkeypatch.setattr(ocr, "recognize", lambda path: [])
+    r = _check_text_artifact(_ctx([_shot(None), _shot(None)], {}))
+    assert r.status == "warn", r
+    assert "unverified" in r.details
 
 
 def test_text_artifact_warns_on_low_confidence_text(monkeypatch):

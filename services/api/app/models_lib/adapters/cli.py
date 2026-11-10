@@ -7,9 +7,19 @@ Contract (design report §3.4):
 - ``submit()`` spawns ``codex exec`` non-interactively (Popen, background)
   and returns a provider_job_id immediately. One call = one agent-loop turn,
   so it is slow (minutes, not seconds).
-- ``poll()`` checks the process; on clean exit it scans
-  ``$CODEX_HOME/generated_images/`` for PNGs newer than the pre-submit
-  snapshot and reports success. No new PNG -> PROVIDER_ERROR.
+- Output attribution (ADR-0014 §4, B7-r2 H1): every job runs in its OWN
+  directory (``-C <job dir>``, created by ``mkdtemp``) and the instruction
+  names an explicit output file inside it (``{output_path}``). ``poll()`` on
+  clean exit takes the explicit file, else a PNG the CLI wrote inside that
+  per-job directory (only this job's process works there). The CLI's shared
+  image folder (``$CODEX_HOME/generated_images/``) is NEVER used: nothing
+  there proves which job produced a file, so a CLI that ignored the per-job
+  path fails the job (PROVIDER_ERROR) instead of guessing.
+- Provider input contract: ``prompt`` + ``negative_prompt`` (``{negative}``
+  or ``{negative_prompt}`` in the template, else appended as "Avoid: ...").
+  Editing inputs (``init_image`` / ``mask``) are rejected (VALIDATION_ERROR)
+  before anything is spawned; reference images are not consumed (the
+  enqueue snapshot records that degrade).
 - ``fetch_result()`` returns the PNG bytes. The task layer saves them to
   storage (relative paths in DB); the adapter never writes project files.
 - Error mapping: CLI binary missing / not logged in -> MODEL_UNAVAILABLE
@@ -31,8 +41,9 @@ Seed config schema (model seed JSON, ``capabilities.cli``)::
                       "--enable", "image_generation",
                       "--approve-for-me"],
         "prompt_template": "Generate an image from this description: {prompt}",
+                                         # optional {negative} / {output_path}
         "timeout_sec": 600,              # agent-loop wall clock (default 600)
-        "workdir": "/tmp"                # agent working root (-C)
+        "workdir": "/tmp"                # parent of the per-job directories
       }
     }
 """
@@ -53,10 +64,14 @@ from typing import Optional
 
 from app.core.errors import ErrorCode, StudioError
 from app.models_lib.base import EstimatedCost, JobStatus, ProviderAdapter
+from app.models_lib.redaction import redact
 
 log = logging.getLogger(__name__)
 
 _MAX_REMEMBERED_JOBS = 10_000
+# stderr bytes read for an error message (the tail; see _stderr_tail).
+_STDERR_READ_BYTES = 64 * 1024
+_STDERR_QUOTE_CHARS = 500
 
 # Backend capability table. "supports" lists the generation tasks the CLI
 # backend is known to perform. A backend with an empty tuple rejects every
@@ -100,8 +115,8 @@ class _CliJob:
     tool: str
     command: str
     proc: subprocess.Popen
-    out_dir: Path
-    before: set[Path] = field(default_factory=set)
+    out_dir: Path  # the job's OWN directory (the only attributable outputs)
+    output_path: Optional[Path] = None  # explicit file the instruction names
     started_at: float = field(default_factory=time.time)
     timeout_sec: float = 600.0
     stdout_path: Optional[Path] = None
@@ -111,6 +126,50 @@ class _CliJob:
 
 def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+
+
+_OUTPUT_FILENAME = "output.png"
+
+
+def _stderr_tail(path: Optional[Path]) -> str:
+    """The end of the CLI's stderr for an error message, redacted BEFORE it
+    is cut (B7-r3 M1).
+
+    Cutting first could drop a credential's prefix ("Authorization: ...")
+    and leave the value unrecognizable to the redactor. When the file is
+    longer than what is read, the first (partial) line of the read window is
+    dropped for the same reason — a fragment is never quoted.
+    """
+    if path is None:
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _STDERR_READ_BYTES:
+                fh.seek(size - _STDERR_READ_BYTES)
+            raw = fh.read(_STDERR_READ_BYTES)
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", "replace")
+    if size > _STDERR_READ_BYTES:
+        newline = text.find("\n")
+        text = text[newline + 1 :] if newline >= 0 else ""
+    text = redact(text.strip())  # redact the whole window first ...
+    return text[-_STDERR_QUOTE_CHARS:]  # ... then cut
+
+
+def _instruction(template: str, prompt: str, negative: str, output_path: Path) -> str:
+    """Render the CLI instruction from the provider input contract."""
+    text = template.replace("{prompt}", prompt)
+    if "{negative}" in text or "{negative_prompt}" in text:
+        text = text.replace("{negative}", negative).replace("{negative_prompt}", negative)
+    elif negative:
+        text += f"\nAvoid: {negative}"
+    if "{output_path}" in text:
+        text = text.replace("{output_path}", str(output_path))
+    else:
+        text += f"\nSave the final image as a PNG file at exactly this path: {output_path}"
+    return text
 
 
 class CliAdapter(ProviderAdapter):
@@ -213,14 +272,22 @@ class CliAdapter(ProviderAdapter):
                 ErrorCode.VALIDATION_ERROR,
                 f"Model {model_id}: submit payload needs a 'prompt'.",
             )
+        editing = [k for k in ("init_image", "mask") if payload.get(k)]
+        if editing:
+            raise StudioError(
+                ErrorCode.VALIDATION_ERROR,
+                f"Model {model_id}: the cli backend cannot take {', '.join(editing)}.",
+                details={"reason": "input_unsupported", "inputs": editing},
+            )
+        # Contract key is negative_prompt ("negative" kept as a legacy alias).
+        negative = str(payload.get("negative_prompt") or payload.get("negative") or "").strip()
         template = str(cfg.get("prompt_template") or "Generate an image from this description: {prompt}")
-        instruction = template.replace("{prompt}", prompt).replace(
-            "{negative}", str(payload.get("negative") or "")
-        )
 
-        out_dir = _codex_home() / "generated_images"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        before = set(out_dir.rglob("*.png"))
+        workdir = str(cfg.get("workdir") or tempfile.gettempdir())
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        job_dir = Path(tempfile.mkdtemp(prefix="cli-job-", dir=workdir))
+        output_path = job_dir / _OUTPUT_FILENAME
+        instruction = _instruction(template, prompt, negative, output_path)
 
         exec_args = cfg.get("exec_args") or [
             "exec",
@@ -229,19 +296,23 @@ class CliAdapter(ProviderAdapter):
             "image_generation",
             "--approve-for-me",
         ]
-        workdir = str(cfg.get("workdir") or tempfile.gettempdir())
-        argv = [command, *exec_args, "-C", workdir, instruction]
+        argv = [command, *exec_args, "-C", str(job_dir), instruction]
 
-        stdout_path = Path(tempfile.mkstemp(prefix="cli-adapter-out-")[1])
-        stderr_path = Path(tempfile.mkstemp(prefix="cli-adapter-err-")[1])
+        # Logs live in the job directory (cleaned with it after a successful
+        # fetch). The parent's handles are closed right after the spawn; the
+        # child keeps its own copies (B7-r3 M4: no descriptor per submit is
+        # left open in a long-lived worker).
+        stdout_path = job_dir / "cli.stdout.log"
+        stderr_path = job_dir / "cli.stderr.log"
         try:
-            proc = subprocess.Popen(
-                argv,
-                stdout=stdout_path.open("wb"),
-                stderr=stderr_path.open("wb"),
-                stdin=subprocess.DEVNULL,
-                cwd=workdir,
-            )
+            with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=out,
+                    stderr=err,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(job_dir),
+                )
         except OSError as exc:
             raise StudioError(
                 ErrorCode.MODEL_UNAVAILABLE,
@@ -256,8 +327,8 @@ class CliAdapter(ProviderAdapter):
                 tool=tool,
                 command=command,
                 proc=proc,
-                out_dir=out_dir,
-                before=before,
+                out_dir=job_dir,
+                output_path=output_path,
                 timeout_sec=float(cfg.get("timeout_sec", 600.0)),
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
@@ -289,12 +360,8 @@ class CliAdapter(ProviderAdapter):
         return self._finish(job, provider_job_id, rc)
 
     def _finish(self, job: _CliJob, provider_job_id: str, rc: int) -> JobStatus:
-        stderr_tail = ""
-        if job.stderr_path and job.stderr_path.exists():
-            try:
-                stderr_tail = job.stderr_path.read_text(errors="replace")[-2000:]
-            except OSError:
-                stderr_tail = ""
+        # Provider text lands in error_message: redacted, then capped.
+        stderr_tail = _stderr_tail(job.stderr_path)
         if rc != 0:
             lowered = stderr_tail.lower()
             if any(m in lowered for m in _QUOTA_MARKERS):
@@ -303,27 +370,31 @@ class CliAdapter(ProviderAdapter):
                 # retryable=False so the task layer does not requeue.
                 raise StudioError(
                     ErrorCode.RATE_LIMITED,
-                    f"CLI subscription quota exceeded for '{job.command}': {stderr_tail.strip()[:500]}",
+                    f"CLI subscription quota exceeded for '{job.command}': {stderr_tail}",
                     retryable=False,
                 )
             return JobStatus(
                 state="failed",
                 error_code=ErrorCode.PROVIDER_ERROR,
-                error_message=f"CLI tool '{job.command}' exited with code {rc}: {stderr_tail.strip()[:500]}",
+                error_message=f"CLI tool '{job.command}' exited with code {rc}: {stderr_tail}",
             )
-        new_pngs = [
-            p for p in set(job.out_dir.rglob("*.png")) - job.before if p.is_file()
-        ]
-        if not new_pngs:
+        picked = self._own_output(job)
+        if picked is None:
+            # No shared-folder guessing (B7-r2 H1): a PNG elsewhere cannot be
+            # attributed to this job.
             return JobStatus(
                 state="failed",
                 error_code=ErrorCode.PROVIDER_ERROR,
                 error_message=(
-                    f"CLI tool '{job.command}' finished but produced no PNG under "
-                    f"{job.out_dir}. Check {job.stderr_path} for details."
+                    f"CLI tool '{job.command}' finished but did not write the "
+                    f"per-job output file {job.output_path} (no PNG under "
+                    f"{job.out_dir}). An image it may have left in the shared "
+                    f"folder {_codex_home() / 'generated_images'} cannot be "
+                    "attributed to this job and is not used. "
+                    f"Check {job.stderr_path} for details."
                 ),
             )
-        newest = max(new_pngs, key=lambda p: p.stat().st_mtime)
+        newest = picked
         job.png_path = newest
         return JobStatus(
             state="succeeded",
@@ -331,6 +402,14 @@ class CliAdapter(ProviderAdapter):
             stage="done",
             output_urls=[newest.name],
         )
+
+    @staticmethod
+    def _own_output(job: _CliJob) -> Optional[Path]:
+        """The explicit output file, else any PNG in the job's own directory."""
+        if job.output_path is not None and job.output_path.is_file():
+            return job.output_path
+        own = [p for p in job.out_dir.rglob("*.png") if p.is_file()]
+        return max(own, key=lambda p: p.stat().st_mtime) if own else None
 
     def cancel(self, provider_job_id: str) -> None:
         job = self._jobs.get(provider_job_id)
@@ -358,6 +437,8 @@ class CliAdapter(ProviderAdapter):
                 f"CLI job {provider_job_id} has no retrievable PNG.",
             )
         data = job.png_path.read_bytes()
-        # One-shot: drop the in-memory record after a successful fetch.
+        # One-shot: drop the in-memory record (and the job directory) after
+        # a successful fetch.
         self._jobs.pop(provider_job_id, None)
+        shutil.rmtree(job.out_dir, ignore_errors=True)
         return data

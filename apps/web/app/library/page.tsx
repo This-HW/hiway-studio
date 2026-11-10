@@ -171,9 +171,9 @@ export default function LibraryPage() {
           <div className="grid-cards">
             {s.globalCharacters.map((c) => (
               <div key={c.id} className="card">
-                {c.master_thumbnail_url ? (
+                {c.master_thumbnail ? (
                   <img
-                    src={c.master_thumbnail_url}
+                    src={resolveFileUrl(c.master_thumbnail) ?? undefined}
                     alt={c.name}
                     className="thumb square"
                   />

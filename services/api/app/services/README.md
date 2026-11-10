@@ -14,6 +14,8 @@
 - Phase 2: `prompt_assembly.py`, `approval.py`, `continuity.py`, `idempotency.py` (D-13.2, Phase 1에서 이월)
 - Phase 4: `cost_estimator.py`, `budget_guard.py`, `qc_orchestrator.py`
 - Phase 3: `render.py`
+- 감사 수정(계획 `docs/plans/2026-11-09-audit-roadmap-fixes/`): `job_execution.py`·`job_recovery.py` (잡 실행 소유권·복구, ADR-0013),
+  `provider_input.py` (provider 입력 스냅샷, ADR-0014). `idempotency.py`는 DB `idempotency_records` 기반으로 바뀌었다(계획 D2)
 
 상세 카드(인터페이스·불변식·함정)는 `docs/MODULES.md`의 services 섹션 참조.
 

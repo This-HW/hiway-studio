@@ -76,6 +76,27 @@ class Generation(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     canceled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- execution ownership (ADR-0013, plan D4/D7) -------------------------
+    # exec_token: issued by the queued->running claim; every later worker
+    # write is conditional on id + exec_token + status='running'.
+    exec_token: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # none | intent | submitted (D7). 'intent' is committed BEFORE the
+    # provider submit call; anything past 'none' is never auto-resubmitted.
+    submit_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="none"
+    )
+    # Last time the job was put on the broker (reconcile re-dispatch clock).
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Budget period anchor (B5 review H1): set when the row is created and
+    # again on every manual retry, so a retry approved this month stays in
+    # this month's ledger even when the row was created earlier.
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

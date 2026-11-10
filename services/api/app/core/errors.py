@@ -25,12 +25,18 @@ class ErrorCode:
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     LORA_TOO_FEW_IMAGES = "LORA_TOO_FEW_IMAGES"
     DUPLICATE_KEYFRAME = "DUPLICATE_KEYFRAME"
+    # D7 (ADR-0013): the provider submit may or may not have happened (response
+    # lost, timeout after send, crash after intent). Never auto-resubmitted.
+    PROVIDER_UNCERTAIN = "PROVIDER_UNCERTAIN"
+    # D2: an Idempotency-Key was reused with a different request body.
+    IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 
     ALL = (
         VALIDATION_ERROR, NOT_FOUND, APPROVAL_REQUIRED, QC_FAILED, RENDER_LOCKED,
         STYLE_KIT_LOCKED, SUBTITLE_OVERLAP, PROMPT_TOO_LONG, MODERATION_BLOCKED,
         BUDGET_EXCEEDED, QUEUE_FULL, RATE_LIMITED, PROVIDER_ERROR, MODEL_UNAVAILABLE,
-        LORA_TOO_FEW_IMAGES, DUPLICATE_KEYFRAME,
+        LORA_TOO_FEW_IMAGES, DUPLICATE_KEYFRAME, PROVIDER_UNCERTAIN,
+        IDEMPOTENCY_CONFLICT,
     )
 
 
@@ -51,6 +57,8 @@ ERROR_HTTP_STATUS: dict[str, int] = {
     ErrorCode.MODEL_UNAVAILABLE: 503,
     ErrorCode.LORA_TOO_FEW_IMAGES: 422,
     ErrorCode.DUPLICATE_KEYFRAME: 422,
+    ErrorCode.PROVIDER_UNCERTAIN: 502,
+    ErrorCode.IDEMPOTENCY_CONFLICT: 409,
 }
 
 # Retryable as defined in §8.4. BUDGET_EXCEEDED becomes retryable only after the
@@ -72,6 +80,10 @@ ERROR_RETRYABLE: dict[str, bool] = {
     ErrorCode.MODEL_UNAVAILABLE: True,
     ErrorCode.LORA_TOO_FEW_IMAGES: False,
     ErrorCode.DUPLICATE_KEYFRAME: False,
+    # Not auto-retryable: a manual retry creates a new attempt (D7).
+    ErrorCode.PROVIDER_UNCERTAIN: False,
+    # Same key, different body: resending cannot succeed (use a new key).
+    ErrorCode.IDEMPOTENCY_CONFLICT: False,
 }
 
 

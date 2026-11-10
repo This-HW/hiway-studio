@@ -18,7 +18,8 @@ services:
 
   api:
     build:
-      context: ./services/api
+      context: .
+      dockerfile: services/api/Dockerfile
     command: uvicorn app.main:app --host 0.0.0.0 --port ${API_PORT:-8000}
     env_file: .env
     environment:
@@ -32,11 +33,14 @@ services:
       redis:
         condition: service_started
     ports:
-      - "${API_PORT:-8000}:${API_PORT:-8000}"
+      # Loopback only: the API has no authentication, so never publish it on
+      # all interfaces.
+      - "127.0.0.1:${API_PORT:-8000}:${API_PORT:-8000}"
 
   worker:
     build:
-      context: ./services/api
+      context: .
+      dockerfile: services/api/Dockerfile
     command: celery -A app.tasks.celery_app worker -Q q.image,q.video,q.audio,q.post --loglevel=info
     env_file: .env
     environment:

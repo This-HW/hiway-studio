@@ -39,9 +39,11 @@
 
 ```
 ai-studio/
-├── docker-compose.yml          # postgres, redis, api, worker (+comfyui, 프로필로 분리)
+├── docker-compose.yml          # postgres, redis, api, worker (빌드 컨텍스트 = 레포 루트, API는 127.0.0.1에만 게시. ComfyUI는 compose 밖 별도 프로세스 — COMFYUI_URL)
 ├── .env.example                # 모든 환경변수 목록 (값은 .env에만)
-├── Makefile                    # make dev / make migrate / make seed / make gen-types / make test
+├── Makefile                    # make dev / migrate / seed / gen-types / gen-types-check / test / verify-cjk / lint-imports / demo
+├── .github/workflows/ci.yml    # CI: api(pytest SQLite+Postgres·ruff·lint-imports·contracts·compose loopback) / web / image
+├── tools/                      # lint_imports.py, demo.py, check_compose_loopback.py, verify_cjk_burnin.py 등
 ├── apps/
 │   └── web/                    # Next.js 14 App Router + TS + Zustand + TanStack Query
 │       ├── app/                # 라우트 (아래 §5)
@@ -52,7 +54,7 @@ ai-studio/
 │   └── api/                    # FastAPI + Celery (단일 Python 패키지)
 │       ├── app/
 │       │   ├── main.py
-│       │   ├── core/           # config, errors(16종), middleware, sse_bridge, idempotency
+│       │   ├── core/           # config, errors(18종), middleware, sse_bridge, defaults, celery_app, contracts
 │       │   ├── db/             # session, base, alembic/ (마이그레이션)
 │       │   ├── models/         # SQLAlchemy — 도메인별 1파일 (§4.1)
 │       │   ├── schemas/        # Pydantic — 도메인별 1파일 (§4.2)
@@ -143,6 +145,9 @@ path traversal·절대경로는 404. 로컬 전제라 CDN 없음.
 `prompt_assembly.py` (§7), `cost_estimator.py` (§9), `budget_guard.py` (D-28: 403 차단),
 `approval.py` (D-13, D-26), `continuity.py` (D-15 폴백 체인), `qc_orchestrator.py` (§10),
 `render.py` (타임라인 렌더), `episode_clone.py` (D-23 deep copy), `idempotency.py` (D-13.2 멱등키).
+이후 단계에서 도메인별 서비스가 더해졌다. 잡 실행 소유권은 `job_execution.py`, 잃은 잡 복구는
+`job_recovery.py`(ADR-0013), provider 입력 스냅샷은 `provider_input.py`(ADR-0014)가 맡는다.
+전체 카드는 `docs/MODULES.md`.
 
 ### 4.5 models_lib/ — 모델 추상화
 
@@ -152,20 +157,26 @@ models_lib/
 ├── registry.py      # DB 기반 레지스트리 조회·캐시
 ├── router.py        # 라우터 규칙 (설계서 §3.3)
 ├── seed.py          # 초기 모델 seed 로더
+├── contract.py      # provider 입력 계약 (이미지 잡 payload 키, ADR-0014)
+├── capabilities.py  # seed의 tasks/inputs 해석 + enqueue 사전 검사 (ADR-0014)
+├── media_check.py   # 결과 Content-Type·바이트 상한·매직 바이트 검사 (ADR-0014)
 └── adapters/
     ├── stub.py          # 테스트용 가짜 제공자 (Phase 0)
-    ├── http_polling.py  # fal/Replicate/직접 API 공용 (Phase 0)
-    ├── comfyui.py       # ComfyUI REST+WS (필요 시점)
+    ├── http_polling.py  # fal/Replicate/직접 API/ComfyUI 공용 (Phase 0). ComfyUI도 seed(comfyui.json)로 붙는다
     └── cli.py           # 구독 기반 CLI 에이전트 (Codex CLI image_gen 등, kind=cli)
 ```
+
+전용 `comfyui.py`(REST+WS) 어댑터는 아직 없다. WebSocket 진행 이벤트가 필요해지면 그때 만든다.
 
 **핵심 규칙: 새 모델 추가 ≠ 새 어댑터 파일.** HTTP 호환 모델은 `infra/seeds/models/*.json`에 1행 추가로 끝낸다.
 새 어댑터는 "프로토콜이 다른 경우" (WebSocket·로컬 프로세스 등)에만 만든다.
 
 ### 4.6 media/ — ffmpeg·OCR 등 (워커 전용)
 
-`ffmpeg_ops.py` (정규화·concat·믹싱·burn-in), `frame_extract.py` (첫/마지막 프레임),
-`thumbnails.py`, `ocr.py` (PaddleOCR), `loudness.py`, `subtitle_render.py` (한글 오버레이, D-17).
+`ffmpeg_ops.py` (정규화·concat·믹싱·burn-in, 프레임 추출 `extract_frame` — 별도 `frame_extract.py`는 두지 않았다),
+`thumbnails.py`, `thumbnail_text.py` (썸네일 타이틀 합성), `ocr.py` (PaddleOCR 계열 rapidocr, 한국어 인식 모델),
+`loudness.py`, `subtitle_render.py` (한글 오버레이, D-17).
+한글 렌더에는 CJK 폰트가 필요하다(이미지에 `fonts-noto-cjk`, 로컬 후보는 `defaults.CJK_FONT_CANDIDATES`).
 
 ### 4.7 tasks/ — 큐별 1파일 (4개)
 
@@ -188,7 +199,19 @@ DB를 진실 공급원으로 삼는다.
 
 `dispatch_after_commit(db, fn)`: generation 행이 커밋된 **후에만** 잡을 큐에
 넣는다. 커밋 전 enqueue 시 빠른 워커가 존재하지 않는 행을 읽는 레이스를
-방지. 롤백 시 콜백은 버려진다.
+방지. 롤백 시 콜백은 버려진다. 콜백 하나가 예외를 내도 나머지는 모두 시도하고
+로그만 남긴다. 놓친 전송은 API lifespan의 reconcile 루프가 다시 보낸다 (ADR-0013).
+
+### 4.8d 잡 실행 소유권·복구 (ADR-0013)
+
+워커는 잡 행을 `queued → running` 조건부 UPDATE로 claim하면서 실행 토큰(`exec_token`)과
+lease를 받는다. 이후 모든 쓰기는 `id + exec_token + 허용 상태` 조건이고, heartbeat가 lease를 늘린다.
+provider submit 전에 `submit_state=intent`를 commit하므로, 제출 여부가 불확실한 실패는
+`PROVIDER_UNCERTAIN`으로 끝나고 **자동 재제출하지 않는다**. retry·cancel은 job_type별 태스크로 간다
+(`job_execution.JOB_TASKS`). 지속 복구는 API lifespan의 주기 루프(`job_recovery.reconcile_once`,
+`RECONCILE_ENABLED`: 미설정이면 켜짐, `SSE_BACKEND=memory`면 꺼짐)와 워커 `worker_ready` 1회 실행이다.
+타임라인 렌더도 같은 토큰 조건을 쓰며, 결과는 시도별 불변 파일(`output_<token8>.mp4`)로 두고
+postflight(인코딩·burn-in 검증)를 통과하면 `output_path`를 조건부 UPDATE로 바꿔 게시한다 (계획 D8).
 
 ### 4.8c app/seed.py — 통합 seed 진입점 (Phase 1)
 
@@ -197,8 +220,11 @@ DB를 진실 공급원으로 삼는다.
 
 ### 4.9 files/ — 저장 규칙
 
-`paths.py` (PROJECTS_ROOT 해결·상대경로 강제), `naming.py` (`{uuid}[_{batch}].{ext}`),
-`immutability.py` (덮어쓰기 방지 가드), `orphans.py` (고아 파일 주간 리포트, 자동삭제 금지).
+`paths.py` (PROJECTS_ROOT 해결·상대경로 강제. symlink까지 resolve한 실제 위치가 루트 안에 있어야 한다),
+`naming.py` (`{uuid}[_{batch}].{ext}`), `immutability.py` (덮어쓰기 방지 가드 — 하드링크/배타 생성이라
+경쟁 중에도 기존 파일을 덮지 않음), `orphans.py` (고아 파일 주간 리포트, 자동삭제 금지).
+워커 산출물은 실행 토큰 앞 8자를 붙인 시도별 이름(예: `{generation_id}_{batch}_{tag}.png`)으로 쓰고,
+LoRA 가중치 파일명은 사용자 입력과 무관한 UUID(`lora/{lora_id}.safetensors`)다.
 
 ---
 
@@ -222,6 +248,8 @@ apps/web/app/
 
 - API 호출은 `lib/api-client.ts` 경유만. 컴포넌트에서 `fetch` 직접 호출 금지.
 - SSE 구독은 `lib/sse.ts` 단일 훅. 화면마다 EventSource를 새로 만들지 않는다.
+  서버는 이름 있는 이벤트(`event: job.progress` 등)를 보내므로 훅이 계약의 이벤트명마다 리스너를 단다.
+  끊긴 동안의 이벤트는 재전송되지 않으므로, 재연결 시 `onResync`로 화면 상태를 다시 읽는다.
 - 화면별 상태는 `stores/<화면>.ts`에 co-location. 전역 공유 상태는 최소화.
 - 타입은 `packages/contracts`에서 생성된 것만 사용 (`make gen-types`). 수동 타입 중복 정의 금지.
 
@@ -231,8 +259,8 @@ apps/web/app/
 
 | 정보 | 정본 위치 | 파생물 |
 |---|---|---|
-| 에러 코드 16종 | `core/errors.py` | contracts → TS |
-| SSE 이벤트 7종 | `core/sse_bridge.py` | contracts → TS |
+| 에러 코드 18종 | `core/errors.py` (미러: `packages/contracts/errors.json`) | `apps/web/lib/contracts.gen.ts` (`make gen-types`, 검사 `make gen-types-check`) |
+| SSE 이벤트 7종 (이름·payload 필드) | `packages/contracts/sse_events.json` | `apps/web/lib/contracts.gen.ts`. pytest autouse 훅이 테스트 중 발행된 SSE payload를 이 계약으로 검사 |
 | 화면비·상태 enum | `packages/contracts/enums.*` | DB CHECK + TS |
 | `[가정]` 기본값 | `core/defaults.py` (§13) | 전부 여기. 코드 내 하드코딩 금지 |
 | 모델 단가 | `model_pricing` 테이블 | seed JSON |
@@ -311,6 +339,11 @@ apps/web/app/
 - 프롬프트 조립: 절단 정책 (D-30) 케이스 + 슬롯 순서(주제→배경→스타일/매체→조명→카메라/렌즈→색감/분위기→파라미터, ADR-0011 §1) + 네거티브 라이브러리 기본 세트 적용 케이스
 - API: 라우터별 스모크 1개 이상
 - 목표: Phase 완료 조건(§2 표)을 테스트로 표현. 커버리지 수치 목표는 두지 않는다
+- DB 격리: 테스트는 서비스 `DATABASE_URL`을 쓰지 않는다(`tests/conftest.py`가 SQLite로 덮어씀).
+  Postgres 테스트는 `TEST_DATABASE_URL`을 명시했을 때만 돌고, DB 이름이 `test`로 끝나지 않으면 아무것도 지우지 않고 실패한다
+- 외부 도구: ffmpeg·CJK 폰트가 필요한 테스트는 `needs_ffmpeg`/`needs_cjk_font` 마커를 단다. 없으면 보이는 skip,
+  `REQUIRE_MEDIA_TOOLS=1`(CI·Docker 이미지·`make test`)이면 실패
+- lint: ruff 최소 규칙(문법 오류·정의되지 않은 이름, `services/api/pyproject.toml`). CI는 `.github/workflows/ci.yml`
 
 ## 12. 로컬 실행
 
@@ -318,10 +351,15 @@ apps/web/app/
 make dev      # docker-compose up (pg+redis+api+worker) & web dev 서버
 make migrate  # alembic upgrade head
 make seed     # 레지스트리·팩 seed (멱등)
-make gen-types# contracts → TS 타입 생성
-make test     # pytest + web typecheck
+make gen-types# contracts → TS 타입 생성 (apps/web/lib/contracts.gen.ts)
+make gen-types-check  # 생성물이 contracts JSON과 일치하는지 검사 (불일치 시 nonzero)
+make test     # docker api 컨테이너에서 pytest(REQUIRE_MEDIA_TOOLS=1, SQLite) + web typecheck
+make verify-cjk    # 이미지 안에서 한글 burn-in 자막·썸네일 OCR 검증
 make lint-imports  # §15 의존성 방향 위반 검사 (순환 import·역방향 의존 차단)
 ```
+
+API 이미지는 레포 루트를 빌드 컨텍스트로 쓴다(`docker build -f services/api/Dockerfile .`, 이미지 안 `/repo/services/api`).
+compose는 API를 `127.0.0.1`에만 게시한다. 기존 설치를 업데이트하면 `make migrate`·`make seed`를 다시 실행한다.
 
 `projects/`, `library/`, `infra/backups/`는 git 제외 (런타임 산출물).
 
@@ -330,17 +368,18 @@ make lint-imports  # §15 의존성 방향 위반 검사 (순환 import·역방�
 ## 13. `[가정]` 기본값 확정 목록
 
 **HW 확정일: 2026-09-30 — #14는 ADR-0001(증분 백업)로 변경, 나머지 14종은 원안대로 확정.**
+**이후 변경: #15는 감사 수정 계획 D2(`docs/plans/2026-11-09-audit-roadmap-fixes/plan.md`)로 DB 기록·24시간 TTL로 바뀌었다.**
 확정값은 구현 시 `app/core/defaults.py`에 그대로 반영한다.
 
 설계서 v1.0에서 `[가정]`으로 표시된 항목 중 주요 수치. `core/defaults.py` 한 곳에 모아 구현한다.
 
 | # | 항목 | 현재 기본값 | HW 결정 |
 |---|---|---|---|
-| 1 | 재시도 횟수·간격 | 최대 3회, 5→10→20초 지수 백오프+지터 | |
+| 1 | 재시도 횟수·간격 | 최대 3회, 5→10→20초 지수 백오프+지터 | 자동 재시도는 provider에 확실히 전송되지 않은 실패만. submit 이후 결과가 불확실하면 `PROVIDER_UNCERTAIN`, 자동 재제출 없음 (ADR-0013, 계획 D7) |
 | 2 | 큐 상한·포화 응답 | 100개 초과 시 429, retry_after 60초 | |
 | 3 | 워커 동시성 | image 4 / video 2 / audio 2 / post 2 | |
 | 4 | 출력 정규화 | 1920×1080·24fps·H.264·AAC 48kHz, 레터박스 | |
-| 5 | 예산 | 경고 80%·차단 100%, 초과 시 신규 잡 403 | |
+| 5 | 예산 | 경고 80%·차단 100%, 초과 시 신규 잡 403 | 판정 기준은 지출 + 예약(대기·실행 중 잡, 불확실 시도 보류, pending LLM). 프로젝트 행 잠금 아래 같은 트랜잭션에서 확인·예약 (계획 D1) |
 | 6 | 자막 QC 임계 | 큐 1~7초, CPS 20, 겹침 fail | |
 | 7 | 연속성 QC 임계 | 첫 프레임 SSIM 0.90, 샷 간 0.85 | |
 | 8 | 오디오 QC 임계 | 피크 -1 dBTP, LUFS -16±3 | |
@@ -350,7 +389,7 @@ make lint-imports  # §15 의존성 방향 위반 검사 (순환 import·역방�
 | 12 | OCR | PaddleOCR, 신뢰도 0.85/0.5, 클립 1초 샘플링 | |
 | 13 | 저장 포맷 | 생성 png, 썸네일 jpg(q85), TTS wav, BGM mp3 | |
 | 14 | 백업 | 파일: 매일 rsync 하드링크 스냅샷 30세대 / DB 덤프: 매일 14일 보관 (ADR-0001) | |
-| 15 | 멱등키 | 60초 윈도우, `Idempotency-Key` 헤더 | |
+| 15 | 멱등키 | `Idempotency-Key` 헤더, DB `idempotency_records`(UNIQUE method+실제 경로+key), `IDEMPOTENCY_TTL_SEC` 86400초. 같은 본문 → 저장된 응답 재생, 다른 본문 → 409 `IDEMPOTENCY_CONFLICT` | 계획 D2로 변경 (원안: 60초 메모리 윈도우) |
 
 ---
 

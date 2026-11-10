@@ -6,10 +6,14 @@ image/video-only.
 """
 from __future__ import annotations
 
+import contextvars
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+from app.core.contracts import seeds_dir
 from app.core.errors import ErrorCode, StudioError
 from app.models_lib.adapters.http_polling import HttpPollingAdapter
 from app.models_lib.adapters.cli import CliAdapter
@@ -24,10 +28,26 @@ _ADAPTERS: dict[str, ProviderAdapter] = {
 
 _seed_cache: dict[str, dict[str, Any]] | None = None
 
+# The model entry a worker resolved (DB overlay) and is executing right now.
+# Adapters look their config up by model_id without a DB session; inside
+# ``pinned_model`` they get exactly the entry the worker hashed and recorded
+# (B7-r2 M4) instead of the seed cache.
+_pinned: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "registry_pinned_model", default=None
+)
+
+
+@contextmanager
+def pinned_model(model: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    token = _pinned.set(model)
+    try:
+        yield model
+    finally:
+        _pinned.reset(token)
+
 
 def seed_dir() -> Path:
-    # services/api/app/models_lib/registry.py -> repo root is parents[4].
-    return Path(__file__).resolve().parents[4] / "infra" / "seeds" / "models"
+    return seeds_dir() / "models"
 
 
 def _load_seed_cache() -> dict[str, dict[str, Any]]:
@@ -51,7 +71,11 @@ def get_adapter(provider_id: str) -> ProviderAdapter:
 
 def get_model(model_id: str, db=None) -> dict[str, Any]:
     """Return the registry entry. db is an optional SQLAlchemy session for the
-    DB-overlay lookup; without it the seed cache is used."""
+    DB-overlay lookup; without it the pinned entry (``pinned_model``) of
+    that model_id, else the seed cache is used."""
+    pinned = _pinned.get()
+    if db is None and pinned is not None and pinned.get("model_id") == model_id:
+        return pinned
     if db is not None:
         from app.models.system import Model  # noqa: PLC0415 (deferred: models_lib -> models is allowed)
 

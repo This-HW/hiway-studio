@@ -144,9 +144,13 @@ def add_reference(
     return ShotReferenceRead.model_validate(scene_service.reference_card(db, ref))
 
 
-@router.delete("/references/{reference_id}", status_code=204)
-def delete_shot_reference(reference_id: uuid.UUID, db: Session = Depends(get_db)) -> None:
-    scene_service.delete_reference(db, reference_id)
+# ADR-0012: shot references are deleted under their shot. The bare
+# `/references/{id}` path belongs to character references (routers/characters.py).
+@router.delete("/shots/{shot_id}/references/{reference_id}", status_code=204)
+def delete_shot_reference(
+    shot_id: uuid.UUID, reference_id: uuid.UUID, db: Session = Depends(get_db)
+) -> None:
+    scene_service.delete_reference(db, shot_id, reference_id)
 
 
 @router.get("/scenes/{scene_id}/camera-check", response_model=CameraCheckResponse)

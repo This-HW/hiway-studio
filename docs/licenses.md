@@ -1,7 +1,7 @@
 # 의존성 라이선스 기록
 
-2026-09-30 마무리 단계에서 전수 확인: `pyproject.toml`·`package.json`·`app/` import 스캔 결과,
-아래 목록이 전체이며 누락 없음. `imageio-ffmpeg`는 사용하지 않음 (코드·의존성 모두 없음).
+범위: 런타임·테스트 Python 의존성(`pyproject.toml`), 웹 의존성(`package.json`), API Docker 이미지에
+직접 설치하는 시스템 패키지·도구. 2026-09-30 전수 확인 후 2026-11-10 감사 수정(ruff, 이미지 패키지)을 반영했다. `imageio-ffmpeg`는 사용하지 않음 (코드·의존성 모두 없음).
 패키지 버전이 확정되면 각 패키지의 실제 배포 라이선스를 재확인할 것.
 
 | 패키지 | 용도 | 라이선스 |
@@ -21,6 +21,8 @@
 | python-multipart | 파일 업로드 파싱 (Phase 1) | Apache-2.0 |
 | next | 웹 프레임워크 | MIT |
 | react | 웹 UI | MIT |
+| react-dom | 웹 UI 렌더러 | MIT |
+| @types/node, @types/react, @types/react-dom | 웹 타입 정의 (devDependencies) | MIT |
 | typescript | 웹 타입 시스템 | Apache-2.0 |
 | zustand | 웹 상태 관리 | MIT |
 | tanstack-query | 웹 데이터 패칭 | MIT |
@@ -29,7 +31,13 @@
 
 | 패키지 | 용도 | 라이선스 |
 |---|---|---|
-| ffmpeg (+ffprobe) | 클립 정규화·concat·렌더 (시스템 바이너리, pip 아님) | LGPL/GPL 빌드 의존 — Dockerfile에 LGPL 빌드 설치. OSS_PLAN.md §의존성 참고 |
+| ffmpeg (+ffprobe) | 클립 정규화·concat·렌더 (시스템 바이너리, pip 아님) | LGPL/GPL 빌드 의존 — Docker 이미지는 Debian `ffmpeg` 패키지를 설치한다(Debian 빌드는 GPL 옵션 포함). 이미지를 재배포할 때는 GPL 조건을 따른다. OSS_PLAN.md §의존성 참고 |
+| fonts-noto-cjk | 한글 burn-in 자막·썸네일 텍스트 렌더 (Debian 패키지, 이미지에만 설치) | SIL OFL 1.1 |
+| fontconfig | 폰트 탐색 (Debian 패키지, 이미지) | MIT 계열(fontconfig 라이선스) |
+| nodejs | `@openai/codex` 실행 (Debian 패키지, 이미지) | MIT |
+| npm | `@openai/codex` 설치 (Debian 패키지, 이미지) | Artistic-2.0 |
+| @openai/codex | `cli` provider 어댑터가 호출 (이미지에 전역 설치) | Apache-2.0 |
+| ruff | 최소 lint 게이트 (test extra, 개발 도구) | MIT |
 
 ## Unit B 추가 (OCR 엔진, 2026-10-01)
 
@@ -48,8 +56,10 @@ PaddleOCR PP-OCR 모델을 ONNX Runtime으로 구동 (paddlepaddle 불필요). �
 | flatbuffers | onnx 직렬화 (rapidocr 의존) | Apache-2.0 |
 
 모델: korean_PP-OCRv5_mobile_rec (PaddlePaddle 공식 ONNX export, Apache-2.0 계열).
-첫 실행 시 공식 호스트(paddle-model-ecology.bj.bcebos.com)에서 다운로드 후
-SHA-256 검증, `~/.cache/ai-studio/ocr/`에 캐시. 저장소에는 모델 바이너리 미포함.
+공식 호스트(paddle-model-ecology.bj.bcebos.com)에서 다운로드 후 SHA-256 검증.
+로컬 실행은 첫 사용 시 `~/.cache/ai-studio/ocr/`(또는 `OCR_MODELS_DIR`)에 캐시하고,
+Docker 이미지는 빌드 시 `/opt/ai-studio/ocr`에 받아 둔다(오프라인 실행용).
+저장소에는 모델 바이너리 미포함.
 
 ## Unit C 추가 (QC vision 스코어러, 2026-10-01)
 

@@ -140,12 +140,16 @@ def _mark_dependent_shots_stale(db: Session, character_id: uuid.UUID) -> None:
             Generation.is_batch.is_(False),
         )
         .distinct()
+        .order_by(Shot.id)  # one row-lock order across concurrent edits
         .all()
     )
     for (shot_id,) in stale_ids:
         shot = db.get(Shot, shot_id)
         if shot is not None:
-            shot.frame_stale = True
+            # Bumps frame_stale_rev too, also on an already-stale shot, so an
+            # enqueue that assembled the old appearance keeps the warning
+            # (B4R4-M1).
+            shot.mark_frame_stale()
 
 
 def delete_character(db: Session, character_id: uuid.UUID) -> None:

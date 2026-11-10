@@ -53,7 +53,10 @@ export default function ProjectLayout({
     },
     [applySseEvent]
   );
-  const sseState = useSse(handleSse, { enabled: true });
+  const resync = useWorkspaceStore((s) => s.resync);
+  // onResync: after a reconnect, missed events are not replayed, so every
+  // screen refetches (eventSeq bump).
+  const sseState = useSse(handleSse, { enabled: true, onResync: resync });
 
   useEffect(() => {
     setProjectId(projectId);

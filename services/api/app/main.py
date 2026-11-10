@@ -1,9 +1,15 @@
 """AI Studio API. Phase-1 surface: projects, stories, characters, assets, style. Phase 3: video, timelines, export presets."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncIterator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.core import defaults
 from app.core.config import get_settings
 from app.core.middleware import register_middleware
 from app.routers import (
@@ -37,8 +43,42 @@ from app.routers import (
 )
 
 
+log = logging.getLogger("ai_studio.main")
+
+
+async def _reconcile_loop() -> None:
+    """Periodic job reconcile (ADR-0013, plan D4/H1).
+
+    Runs in a thread so DB / broker calls never block the event loop; any
+    error (DB down, broker unreachable) is logged and retried next interval.
+    """
+    from app.services import job_recovery
+
+    while True:
+        try:
+            await asyncio.to_thread(job_recovery.reconcile_once)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must survive any failure
+            log.exception("job reconcile pass failed")
+        await asyncio.sleep(defaults.RECONCILE_INTERVAL_SEC)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Background task only: start-up never waits on the DB or the broker.
+    task = asyncio.create_task(_reconcile_loop()) if get_settings().reconcile_active else None
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AI Studio API", version="0.3.0")
+    app = FastAPI(title="AI Studio API", version="0.3.0", lifespan=lifespan)
     register_middleware(app)
     # The web UI runs on a different origin (port 3000); without this the
     # browser blocks every API call (CORS). Origins are configurable via

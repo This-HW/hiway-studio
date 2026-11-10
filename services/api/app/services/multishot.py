@@ -5,12 +5,20 @@ Flow:
      is frame_approved, checks budget (per_image x 6), locks the scene state
      into a MultishotSet row + 6 MultishotFrame rows, and dispatches the
      q.p1.run_multishot orchestrator (task arg = the set id, ADR-0008).
-  2. run_multishot() (worker): inserts 6 angle shots right after the base shot,
+  2. run_multishot() (worker): claims the set (conditional UPDATE
+     queued -> running as the FIRST statement of its transaction) and, in that
+     same transaction, inserts 6 angle shots right after the base shot,
      assembles each angle's prompt (base prompt + angle instruction), creates
-     one text_to_image generation per angle, and dispatches them on q.image.
+     one text_to_image generation per angle and links it to its frame with a
+     write-once UPDATE (plan D9, RH2). Children are dispatched on q.image only
+     after the commit. A duplicate/redelivered message finds the set no
+     longer queued and is a no-op, so the fan-out happens exactly once;
+     reconcile only re-sends existing queued children and re-aggregates.
   3. The image worker calls on_frame_finished() per child (hooked in
-     tasks_image); the set aggregates to done | partial | failed and publishes
-     job.progress / job.completed for the set id.
+     tasks_image); aggregate_set() locks the set row and aggregates it from
+     ALL frames to done | partial | failed, publishing job.progress /
+     job.completed for the set id after the commit. Reconcile's reaggregate()
+     reflects lost hooks into frames and always re-aggregates (B4B-H5).
 
 The six angles and their shot_type mapping (contract enums):
   establishing -> establishing, wide -> wide, medium -> medium,
@@ -19,9 +27,11 @@ The six angles and their shot_type mapping (contract enums):
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core import defaults
@@ -31,7 +41,7 @@ from app.core.errors import ErrorCode, StudioError
 from app.core.sse_bridge import CHANNEL, get_bridge
 from app.db.session import dispatch_after_commit
 from app.models.multishot import COVERAGE_ANGLES, MULTISHOT_STATUSES, MultishotFrame, MultishotSet
-from app.services import budget_guard, cost_estimator
+from app.services import budget_guard, cost_estimator, provider_input
 
 ANGLE_SHOT_TYPE: dict[str, str] = {
     "establishing": "establishing",
@@ -175,6 +185,7 @@ def request_coverage(
         source_frame_generation_id=shot.approved_frame_generation_id,
         state_snapshot=_state_snapshot(db, shot, resolved_model),
         status="queued",
+        dispatched_at=datetime.now(timezone.utc),
     )
     db.add(mset)
     db.flush()
@@ -203,15 +214,45 @@ def _check_status(value: str) -> str:
 
 
 def run_multishot(db: Session, multishot_set_id: str) -> dict[str, Any]:
-    """Worker: insert the 6 angle shots and queue one frame job per angle."""
+    """Worker: claim the set, insert the 6 angle shots and queue one frame
+    job per angle — all in the caller's ONE transaction (plan D9, RH2).
+
+    The claim is the first statement: on Postgres it row-locks the set, so a
+    concurrent duplicate delivery blocks, re-evaluates `status='queued'`
+    after this commit and gets 0 rows; SQLite serializes the writers the
+    same way. Each frame link is a write-once UPDATE (`generation_id IS
+    NULL`), backed by UNIQUE(generation_id)/UNIQUE(shot_id): if anything
+    would fan out twice the whole transaction rolls back. A crash before the
+    commit leaves the set queued with no children, so redelivery/reconcile
+    redoes the single fan-out safely. Dispatch and SSE happen after commit.
+    """
     from app.models.generation import Generation
     from app.models.production import Scene, Shot, ShotReference
     from app.services import prompt_assembly
 
-    mset = db.get(MultishotSet, uuid.UUID(multishot_set_id))
+    set_id = uuid.UUID(multishot_set_id)
+    # Budget lock BEFORE the claim (lock order Project -> set; B5 review H2):
+    # the queued set's reservation turns into leaf frame jobs in this
+    # transaction, and a budget check must never read between the two forms.
+    project_id_row = (
+        db.query(Scene.project_id)
+        .join(Shot, Shot.scene_id == Scene.id)
+        .join(MultishotSet, MultishotSet.shot_id == Shot.id)
+        .filter(MultishotSet.id == set_id)
+        .first()
+    )
+    if project_id_row is not None:
+        budget_guard.lock_project(db, project_id_row[0])
+    claimed = db.execute(
+        update(MultishotSet)
+        .where(MultishotSet.id == set_id, MultishotSet.status == "queued")
+        .values(status=_check_status("running"))
+        .execution_options(synchronize_session=False)
+    ).rowcount == 1
+    mset = db.get(MultishotSet, set_id, populate_existing=True)
     if mset is None:
         raise StudioError(ErrorCode.NOT_FOUND, "Multishot set not found.")
-    if mset.status != "queued":
+    if not claimed:
         return {"multishot_set_id": str(mset.id), "status": mset.status, "resumed": True}
 
     base = _get_shot(db, mset.shot_id)
@@ -219,10 +260,7 @@ def run_multishot(db: Session, multishot_set_id: str) -> dict[str, Any]:
     project_id = scene.project_id if scene else _project_id_of(db, base)
     model_id = str((mset.state_snapshot or {}).get("model_id") or _resolve_image_model(db, base, None))
     per_image = cost_estimator.estimate_images(db, model_id, 1)
-
-    mset.status = "running"
-    db.flush()
-    _publish_progress(mset.id, 5.0, "inserting_shots", "running")
+    now = datetime.now(timezone.utc)
 
     # Make room: shift later shots so the 6 coverage shots land right after base.
     db.query(Shot).filter(
@@ -241,6 +279,12 @@ def run_multishot(db: Session, multishot_set_id: str) -> dict[str, Any]:
     )
     by_angle = {f.coverage_type: f for f in frames}
 
+    # Registered BEFORE the child dispatches (B4B-M3): callbacks run in order,
+    # and a child that runs synchronously at dispatch (eager) may already
+    # complete the set; its job.completed must stay the last event.
+    dispatch_after_commit(
+        db, lambda sid=mset.id: _publish_progress(sid, 30.0, "frames_queued", "running")
+    )
     job_ids: list[str] = []
     for i, angle in enumerate(COVERAGE_ANGLES):
         frame = by_angle[angle]
@@ -277,9 +321,16 @@ def run_multishot(db: Session, multishot_set_id: str) -> dict[str, Any]:
                     reference_detail_id=ref.reference_detail_id,
                 )
             )
-        frame.shot_id = shot.id
 
         assembled = prompt_assembly.assemble_shot_prompt(db, shot.id, model_id=model_id)
+        # ADR-0014: resolved references + persisted seed in the snapshot.
+        seed = provider_input.draw_seed()
+        snapshot = provider_input.image_snapshot(
+            db, model_id=model_id, task="text_to_image", seed=seed, seed_source="random",
+            negative_prompt=assembled["negative_final"], references=assembled["references"],
+            style_kit_id=assembled["style_kit_id"],
+            style_kit_version=assembled["style_kit_version"],
+        )
         check_enum("job_type", "text_to_image")
         gen = Generation(
             project_id=project_id,
@@ -292,66 +343,189 @@ def run_multishot(db: Session, multishot_set_id: str) -> dict[str, Any]:
             style_kit_id=assembled["style_kit_id"],
             style_kit_version=assembled["style_kit_version"],
             estimated_cost_usd=per_image,
+            seed=seed,
             params={
                 "_multishot_frame_id": str(frame.id),
                 "truncated_sections": assembled["truncated_sections"],
+                "snapshot": snapshot,
             },
             max_retries=defaults.RETRY_MAX_ATTEMPTS,
+            dispatched_at=now,
+            # The leaves carry the reservation the set was approved under
+            # (its budget period), not the fan-out time: a set queued last
+            # month must not move its cost into this month unchecked
+            # (review B5R2-H1).
+            reserved_at=mset.created_at,
         )
         db.add(gen)
         db.flush()
-        frame.generation_id = gen.id
+        # Write-once link: a frame that already has a child aborts the whole
+        # fan-out (rollback) instead of adding a second set of rows.
+        linked = db.execute(
+            update(MultishotFrame)
+            .where(
+                MultishotFrame.id == frame.id,
+                MultishotFrame.generation_id.is_(None),
+                MultishotFrame.shot_id.is_(None),
+            )
+            .values(shot_id=shot.id, generation_id=gen.id)
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if linked != 1:
+            raise StudioError(
+                ErrorCode.VALIDATION_ERROR,
+                "Multishot frame already has a coverage job; fan-out refused.",
+                details={"multishot_set_id": str(mset.id), "frame_id": str(frame.id)},
+            )
         job_ids.append(str(gen.id))
         dispatch_after_commit(
             db, lambda gid=str(gen.id): dispatch_job("q.image.run_generation", gid)
         )
 
     db.flush()
-    _publish_progress(mset.id, 30.0, "frames_queued", "running")
     return {"multishot_set_id": str(mset.id), "status": "running", "job_ids": job_ids}
 
 
+_FRAME_TERMINAL = ("done", "failed")
+
+
+def reaggregate(db: Session, set_id: uuid.UUID) -> bool:
+    """Reconcile helper (B4B-H5): reflect terminal child generations into
+    frames whose per-frame hook was lost (frame still pending), then ALWAYS
+    re-aggregate the set from the full frame state — also when every frame
+    is already terminal but the set stayed `running` (two last hooks raced).
+    Never creates rows. Returns True when the set reached a terminal status
+    in this call."""
+    from app.models.generation import Generation
+
+    mset = db.get(MultishotSet, set_id)
+    if mset is None or mset.status != "running":
+        return False
+    pending = (
+        db.query(MultishotFrame.id, MultishotFrame.generation_id)
+        .filter(MultishotFrame.multishot_set_id == set_id,
+                MultishotFrame.status == "pending",
+                MultishotFrame.generation_id.is_not(None))
+        .order_by(MultishotFrame.id)  # one frame order for every writer
+        .all()
+    )
+    reflected = 0
+    for frame_id, generation_id in pending:
+        status = db.query(Generation.status).filter(
+            Generation.id == generation_id).scalar()
+        if status not in ("succeeded", "failed", "canceled"):
+            continue
+        # Conditional: a hook that wrote this frame meanwhile wins (0 rows).
+        reflected += db.execute(
+            update(MultishotFrame)
+            .where(MultishotFrame.id == frame_id, MultishotFrame.status == "pending")
+            .values(status="done" if status == "succeeded" else "failed")
+            .execution_options(synchronize_session=False)
+        ).rowcount
+    return aggregate_set(db, set_id, announce=reflected > 0)
+
+
+def aggregate_set(db: Session, set_id: uuid.UUID, *, announce: bool = True) -> bool:
+    """Aggregate a set's status from ALL its frames under the set row lock.
+
+    The lock (SELECT ... FOR NO KEY UPDATE; SQLite serializes writers) is
+    taken BEFORE the frames are read and is held until the caller's commit,
+    so of two frame hooks committing concurrently the later one always sees
+    the earlier one's frame (B4B-H5). Lock order: frame row (already
+    written by the caller) -> set row (ADR-0013).
+
+    SSE (after commit): with `announce` (a frame changed in this
+    transaction) job.progress for a running set and job.completed when every
+    frame is terminal; without it (reconcile found nothing new) only a
+    job.completed for a status that actually changed.
+    Returns True when the set moved from running to a terminal status.
+    """
+    from app.services.generations import lock_row
+
+    mset = lock_row(db, MultishotSet, set_id)
+    if mset is None or mset.status == "queued":
+        return False
+    states = [
+        status for (status,) in db.query(MultishotFrame.status).filter(
+            MultishotFrame.multishot_set_id == set_id)
+    ]
+    if not states:
+        return False
+    done_count = sum(1 for s in states if s == "done")
+    was = mset.status
+    if was == "running" and announce:
+        pct = round(100.0 * done_count / len(states), 1)
+        dispatch_after_commit(db, lambda: _publish_progress(set_id, pct, "frames_done", "running"))
+    if not all(s in _FRAME_TERMINAL for s in states):
+        return False
+    if done_count == len(states):
+        status = "done"
+    elif done_count:
+        status = "partial"
+    else:
+        status = "failed"
+    mset.status = _check_status(status)
+    db.flush()
+    if announce or status != was:
+        dispatch_after_commit(db, lambda: get_bridge().publish(
+            CHANNEL,
+            "job.completed",
+            {
+                "job_id": str(set_id),
+                "job_type": "multishot",
+                "status": status,
+                "output_count": done_count,
+            },
+        ))
+    return was == "running"
+
+
+def fail_set(multishot_set_id: str, code: str, message: str) -> bool:
+    """Persist a crashed fan-out (own committed transaction, plan D9).
+
+    The worker transaction rolled back, so the set is still queued with no
+    children; mark it (and its frames) failed so reconcile does not re-send a
+    deterministic failure forever. Returns True when this call failed it.
+    """
+    from app.db.session import session_scope
+
+    set_id = uuid.UUID(multishot_set_id)
+    with session_scope() as db:
+        result = db.execute(
+            update(MultishotSet)
+            .where(MultishotSet.id == set_id, MultishotSet.status == "queued")
+            .values(status=_check_status("failed"))
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return False
+        db.execute(
+            update(MultishotFrame)
+            .where(MultishotFrame.multishot_set_id == set_id,
+                   MultishotFrame.status == "pending")
+            .values(status="failed")
+            .execution_options(synchronize_session=False)
+        )
+    get_bridge().publish(
+        CHANNEL,
+        "job.failed",
+        {"job_id": multishot_set_id, "job_type": "multishot", "status": "failed",
+         "error_code": code, "error_message": message, "retryable": False,
+         "retry_count": 0, "max_retries": 0},
+    )
+    return True
+
+
 def on_frame_finished(db: Session, frame_id: str, success: bool) -> None:
-    """Called from the image worker when a coverage frame reaches terminal state."""
+    """Called from the image worker when a coverage frame reaches terminal
+    state (inside the child's terminal transaction): write the frame, then
+    aggregate the set under its row lock."""
     frame = db.get(MultishotFrame, uuid.UUID(frame_id))
     if frame is None:
         return
     frame.status = "done" if success else "failed"
     db.flush()
-
-    mset = db.get(MultishotSet, frame.multishot_set_id)
-    if mset is None:
-        return
-    children = (
-        db.query(MultishotFrame)
-        .filter(MultishotFrame.multishot_set_id == mset.id)
-        .all()
-    )
-    states = [c.status for c in children]
-    done_count = sum(1 for s in states if s == "done")
-    _publish_progress(
-        mset.id, round(100.0 * done_count / max(len(states), 1), 1), "frames_done", mset.status
-    )
-    if not all(s in ("done", "failed") for s in states):
-        db.flush()
-        return
-    if all(s == "done" for s in states):
-        mset.status = "done"
-    elif done_count:
-        mset.status = "partial"
-    else:
-        mset.status = "failed"
-    db.flush()
-    get_bridge().publish(
-        CHANNEL,
-        "job.completed",
-        {
-            "job_id": str(mset.id),
-            "job_type": "multishot",
-            "status": mset.status,
-            "output_count": done_count,
-        },
-    )
+    aggregate_set(db, frame.multishot_set_id, announce=True)
 
 
 def approve_frame(db: Session, frame_id: uuid.UUID) -> MultishotFrame:

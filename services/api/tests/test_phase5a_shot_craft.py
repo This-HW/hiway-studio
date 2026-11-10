@@ -302,7 +302,8 @@ def test_variations_prompt_axis(api_env):
     assert "[variation 1 of 2" in prompts[0] and "[variation 2 of 2" in prompts[1]
     assert prompts[0] != prompts[1]
     seeds = [v["seed"] for v in body["variations"]]
-    assert len(set(seeds)) == 2
+    # F15 / ADR-0014: one variable at a time - prompt varies, seed is fixed.
+    assert len(set(seeds)) == 1
 
 
 def test_variations_validation_and_idempotency(api_env):

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -23,26 +24,21 @@ router = APIRouter(tags=["videos"])
 def generate_video(
     shot_id: uuid.UUID,
     body: VideoGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> VideoAcceptedResponse:
-    route = "POST /shots/{shot_id}/video"
-    if idempotency_key:
-        hit = idempotency.recall(route, idempotency_key)
-        if hit is not None:
-            return hit
-    result = video_service.enqueue_video(
-        db,
-        shot_id,
-        mode=body.mode,
-        motion_prompt=body.motion_prompt,
-        duration_sec=body.duration_sec,
-        model_id=body.model_id,
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=VideoAcceptedResponse,
+        create=lambda: video_service.enqueue_video(
+            db,
+            shot_id,
+            mode=body.mode,
+            motion_prompt=body.motion_prompt,
+            duration_sec=body.duration_sec,
+            model_id=body.model_id,
+        ),
     )
-    response = VideoAcceptedResponse.model_validate(result)
-    if idempotency_key:
-        idempotency.remember(route, idempotency_key, response)
-    return response
 
 
 @router.get("/shots/{shot_id}/videos", response_model=list[VideoRead])

@@ -9,6 +9,7 @@ import type { Character, Reference, SheetStarted } from "@/lib/types";
 import { formatEstimatedCost, koreanErrorMessage } from "@/lib/format";
 import { ApiError } from "@/lib/errors";
 import { toast } from "./toast";
+import { useWorkspaceStore } from "./workspace";
 
 export interface SheetOptions {
   views: boolean;
@@ -85,6 +86,14 @@ interface CharacterSheetState {
   generateSheet: () => Promise<void>;
   /** Called by the page when a workspace-tracked job finishes/fails. */
   markJobDone: (jobId: string, failed: boolean) => void;
+  /**
+   * Move every pending sheet job that reached a terminal state out of
+   * pending (canceled counts as not done) and report failed/canceled ones
+   * for the screen's toast (review B6R3-R2-M2).
+   */
+  settlePendingJobs: (
+    jobs: Record<string, { status: string; error_code?: string }>
+  ) => { jobId: string; status: string; errorCode?: string }[];
   togglePrimary: (ref: Reference) => Promise<void>;
   refresh: () => Promise<void>;
 }
@@ -150,9 +159,12 @@ export const useCharacterSheetStore = create<CharacterSheetState>((set, get) => 
         outfits: options.outfits ? SHEET_ROLE_LISTS.outfits : [],
         poses: options.poses ? SHEET_ROLE_LISTS.poses : [],
       };
+      const marker = useWorkspaceStore.getState().reconnects;
       const res = await apiPost<SheetStarted>(
         `/api/v1/characters/${characterId}/sheet`,
-        body
+        body,
+        // One key per click: a double submit replays the same jobs (D2).
+        { idempotencyKey: `sheet-${characterId}-${crypto.randomUUID()}` }
       );
       set({
         generating: false,
@@ -161,6 +173,13 @@ export const useCharacterSheetStore = create<CharacterSheetState>((set, get) => 
         failedJobIds: [],
         estimatedCost: res.estimated_cost_usd ?? null,
       });
+      // After the pending entry exists (review B6R3-M1).
+      useWorkspaceStore
+        .getState()
+        .track(
+          res.job_ids.map((job_id) => ({ job_id, job_type: "text_to_image" })),
+          { reconnectsAtRequest: marker }
+        );
       if (res.estimated_cost_usd !== undefined) {
         toast(
           `시트 생성을 시작했습니다 (${formatEstimatedCost(
@@ -178,6 +197,21 @@ export const useCharacterSheetStore = create<CharacterSheetState>((set, get) => 
           : "시트 생성 요청에 실패했습니다.";
       toast(msg, { kind: "error" });
     }
+  },
+
+  settlePendingJobs: (jobs) => {
+    const reported: { jobId: string; status: string; errorCode?: string }[] = [];
+    for (const jobId of get().pendingJobIds) {
+      const job = jobs[jobId];
+      if (!job) continue;
+      if (job.status === "completed") {
+        get().markJobDone(jobId, false);
+      } else if (job.status === "failed" || job.status === "canceled") {
+        get().markJobDone(jobId, true);
+        reported.push({ jobId, status: job.status, errorCode: job.error_code });
+      }
+    }
+    return reported;
   },
 
   markJobDone: (jobId, failed) => {

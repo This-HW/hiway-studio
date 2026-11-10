@@ -35,7 +35,7 @@
 - 모든 생성 버튼 옆에 예상 비용을 표시한다. 생성 API의 `202` 응답에 `estimated_cost_usd`가 포함되므로,
   버튼 클릭 전에 미리보기(모델·배치 수 기준 추정치)를 보여주고, 응답 값으로 확정 표시한다.
 - 프로젝트 예산(`monthly_budget_usd`): 설정 탭과 비용 화면에 진행률 바로 표시.
-  80% 도달 시 황색 + SSE `cost.alert(level='warn')` 토스트. 100% 초과 시 적색 + 모든 신규 생성 버튼 비활성화
+  80% 도달 시 황색 + SSE `cost.alert` 토스트(payload: `project_id, usage_pct, spent_usd, budget_usd, threshold_pct` — `packages/contracts/sse_events.json`). 100% 초과 시 적색 + 모든 신규 생성 버튼 비활성화
   (서버도 `403 BUDGET_EXCEEDED`로 차단한다).
 - 추정치와 실제치 차이가 20%를 초과하면 해당 잡 상세에 차이 배지를 표시한다 (§9.2).
 
@@ -51,7 +51,7 @@
 | `429 QUEUE_FULL` | `retry_after_sec` 카운트다운 표시 후 재시도 버튼 활성화. |
 | 잡 실패 (`job.failed`) | `error_code` 한글 메시지 + `retryable=true`면 "재시도" 버튼 (`POST /jobs/{id}/retry`). 폴백 체인이 있으면 시도 내역을 함께 보여준다. |
 | 삭제 (프로젝트·씬·샷·캐릭터·에셋) | 확인 모달. 프로젝트 삭제는 `?confirm=true` + 제목 직접 입력 확인 (디렉토리 영구 삭제이므로). |
-| 생성 버튼 | 요청 중 비활성화 + `Idempotency-Key` 헤더 전송 (더블클릭 중복 방지). 60초 윈도우. |
+| 생성 버튼 | 요청 중 비활성화 + `Idempotency-Key` 헤더 전송 (더블클릭 중복 방지). 서버 DB(`idempotency_records`)에 `IDEMPOTENCY_TTL_SEC`(24시간) 동안 보관 — 같은 키·같은 본문은 원 응답 재생, 다른 본문은 409 `IDEMPOTENCY_CONFLICT`. |
 
 ### 0.5 자막·QC·비용 일관 규칙
 
@@ -328,7 +328,7 @@
 |---|---|
 | 씬·샷 CRUD | `GET/POST /projects/{id}/scenes`, `GET/PATCH/DELETE /scenes/{id}`, `GET/POST /scenes/{id}/shots`, `GET/PATCH/DELETE /shots/{id}` |
 | 순서·복제 | `POST /shots/reorder`, `POST /shots/{id}/duplicate` |
-| 레퍼런스 | `GET/POST /shots/{id}/references` |
+| 레퍼런스 | `GET/POST /shots/{id}/references`, `DELETE /shots/{id}/references/{ref_id}` (ADR-0012) |
 | 비용 추정 | `POST /costs/estimate` |
 | 진행률 | `job.progress`, `job.completed`, `job.failed` |
 
@@ -482,7 +482,7 @@
 - 출력:
   - 프리셋 선택: YouTube 16:9 / Shorts 9:16 / Reels / TikTok / 커스텀 (목록 조회는 ADR-0004).
   - 렌더 버튼: 유효한 리포트(`overall != 'fail'`)가 있을 때만 활성화.
-    `POST /timelines/{id}/render {export_preset_id, ignore_warnings?}` → SSE `render.completed` → `output.mp4` 다운로드+플레이어.
+    `POST /timelines/{id}/render {export_preset_id, ignore_warnings?}` → SSE `render.completed` → `GET /timelines/{id}/output`(타임라인 `output_path`가 가리키는 시도별 파일 `output_<token8>.mp4`) 다운로드+플레이어.
 - 비용 대시보드:
   - `GET /projects/{project_id}/costs/summary?group_by=month|project|model` 집계 테이블.
   - 예산 바: 당월 `actual_cost_usd` / `monthly_budget_usd` (80% 황색, 100% 적색).

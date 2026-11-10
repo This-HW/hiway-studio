@@ -11,6 +11,20 @@ Validation (service layer, so both router and task share it):
 
 Every cue/style/mode/track change bumps the affected timelines'
 content_version so QC reports go stale (design §10.4).
+
+Render lock (F13): a cue/style/track change that affects a timeline while it
+is `rendering` raises 409 RENDER_LOCKED (same rule as clip edits) before
+anything is written; `timelines.bump_content_version` enforces it again
+atomically against a concurrent render claim.
+
+Track membership (B4B-H3): which timelines burn a track can change
+concurrently (a timeline's subtitle_track_ids / subtitle_mode). Cue, style
+and track-delete edits and those timeline selection changes therefore take
+one common lock first — the project row (`lock_subtitle_scope`) — and read
+the selecting timelines only after it, in the same transaction. A selection
+change that lands first is seen (its timeline is bumped / RENDER_LOCKED);
+one that comes later waits for the edit's commit. Lock order: project ->
+timeline (ADR-0013).
 """
 from __future__ import annotations
 
@@ -41,19 +55,79 @@ def _get_track(db: Session, track_id: uuid.UUID):
     return track
 
 
-def _bump_timelines_for_track(db: Session, track) -> None:
-    """Bump content_version of timelines that burn this track."""
+def lock_subtitle_scope(db: Session, project_id: uuid.UUID) -> None:
+    """THE common lock of subtitle edits and timeline track selection
+    (B4B-H3): row-lock the project (SELECT ... FOR NO KEY UPDATE; SQLite
+    serializes writers). Take it before reading which timelines select a
+    track and before writing any timeline row (lock order project ->
+    timeline)."""
+    from app.models.project import Project
+    from app.services.generations import lock_row
+
+    if lock_row(db, Project, project_id) is None:
+        raise StudioError(ErrorCode.NOT_FOUND, "Project not found.")
+
+
+def _locked_track(db: Session, track_id: uuid.UUID):
+    """Lock the track's project, then re-read the track (it may have been
+    deleted by an edit that held the lock before us)."""
+    from app.models.subtitle import SubtitleTrack
+
+    track = _get_track(db, track_id)
+    lock_subtitle_scope(db, track.project_id)
+    track = db.get(SubtitleTrack, track_id, populate_existing=True)
+    if track is None:
+        raise StudioError(ErrorCode.NOT_FOUND, "Subtitle track not found.")
+    return track
+
+
+def _timelines_for_track(db: Session, track) -> list:
+    """Timelines that burn this track (current DB state: callers hold the
+    subtitle scope lock, so the membership cannot change until commit)."""
     from app.models.timeline import Timeline
-    from app.services.timelines import bump_content_version
 
     timelines = (
-        db.query(Timeline).filter(Timeline.project_id == track.project_id).all()
+        db.query(Timeline)
+        .filter(Timeline.project_id == track.project_id)
+        .populate_existing()
+        .all()
     )
     wanted = str(track.id)
-    for tl in timelines:
-        ids = tl.subtitle_track_ids or []
-        if wanted in [str(x) for x in ids]:
-            bump_content_version(db, tl.id)
+    return [
+        tl for tl in timelines
+        if wanted in [str(x) for x in (tl.subtitle_track_ids or [])]
+    ]
+
+
+def _require_track_editable(db: Session, track) -> None:
+    """409 RENDER_LOCKED when a timeline burning this track is rendering."""
+    from app.services.render import _require_editable
+
+    for tl in _timelines_for_track(db, track):
+        _require_editable(tl)
+
+
+def _require_project_editable(db: Session, project_id: uuid.UUID) -> None:
+    """409 RENDER_LOCKED when any timeline of the project is rendering
+    (a project-default style change bumps every timeline)."""
+    from app.models.timeline import Timeline
+    from app.services.render import _require_editable
+
+    for tl in (
+        db.query(Timeline)
+        .filter(Timeline.project_id == project_id)
+        .populate_existing()
+        .all()
+    ):
+        _require_editable(tl)
+
+
+def _bump_timelines_for_track(db: Session, track) -> None:
+    """Bump content_version of timelines that burn this track."""
+    from app.services.timelines import bump_content_version
+
+    for tl in _timelines_for_track(db, track):
+        bump_content_version(db, tl.id)
 
 
 def _validate_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -146,7 +220,8 @@ def create_track(
 def delete_track(db: Session, track_id: uuid.UUID) -> None:
     from app.models.subtitle import SubtitleTrack
 
-    track = _get_track(db, track_id)
+    track = _locked_track(db, track_id)
+    _require_track_editable(db, track)
     _bump_timelines_for_track(db, track)
     db.delete(track)  # cues + track style cascade
     db.flush()
@@ -168,7 +243,8 @@ def save_cues(db: Session, track_id: uuid.UUID, cues: list[dict[str, Any]]) -> l
     """Atomically replace a track's cues (validated)."""
     from app.models.subtitle import SubtitleCue
 
-    track = _get_track(db, track_id)
+    track = _locked_track(db, track_id)
+    _require_track_editable(db, track)
     cleaned = _validate_cues(cues)
     db.query(SubtitleCue).filter(SubtitleCue.track_id == track_id).delete()
     rows = [
@@ -252,6 +328,11 @@ def save_style(
             raise StudioError(
                 ErrorCode.VALIDATION_ERROR, "Track does not belong to this project."
             )
+        track = _locked_track(db, track_id)
+        _require_track_editable(db, track)
+    else:
+        lock_subtitle_scope(db, project_id)
+        _require_project_editable(db, project_id)
     position = style.get("position", "bottom")
     check_enum("subtitle_position", position)
     row = (
@@ -292,7 +373,12 @@ def save_style(
         from app.models.timeline import Timeline
         from app.services.timelines import bump_content_version
 
-        for tl in db.query(Timeline).filter(Timeline.project_id == project_id).all():
+        for tl in (
+            db.query(Timeline)
+            .filter(Timeline.project_id == project_id)
+            .populate_existing()
+            .all()
+        ):
             bump_content_version(db, tl.id)
     db.flush()
     return fields

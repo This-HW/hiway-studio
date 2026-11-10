@@ -280,6 +280,7 @@ def test_advisory_results_never_fail_overall(vision_env, monkeypatch, png_image)
     assert _overall(results) == "warn"
 
 
+@pytest.mark.needs_ffmpeg
 def test_video_clip_frames_reach_model(vision_env, monkeypatch, tmp_path):
     clip = tmp_path / "clip.mp4"
     subprocess.run(

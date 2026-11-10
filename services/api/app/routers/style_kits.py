@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -59,20 +60,13 @@ from app.services import idempotency, style_extract as extract_service
 def extract_style(
     kit_id: uuid.UUID,
     body: StyleExtractRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> StyleExtractAcceptedResponse:
-    route = "POST /style-kits/{kit_id}/extract"
-    store = idempotency.get_store()
-    key = store.make_key(route, idempotency_key) if idempotency_key else None
-    if key is not None:
-        hit = store.recall(key)
-        if hit is not None:
-            return StyleExtractAcceptedResponse.model_validate(hit)
-    result = extract_service.request_extract(
-        db, kit_id, source_asset_ids=body.source_asset_ids
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=StyleExtractAcceptedResponse,
+        create=lambda: extract_service.request_extract(
+            db, kit_id, source_asset_ids=body.source_asset_ids
+        ),
     )
-    response = StyleExtractAcceptedResponse.model_validate(result)
-    if key is not None:
-        store.remember(key, response.model_dump(mode="json"))
-    return response

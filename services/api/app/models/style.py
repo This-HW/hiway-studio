@@ -2,6 +2,7 @@
 
 Style kits: project_id NULL = global template. Locked kits are immutable;
 edit them by duplicating (D-31). Inheritance: shot -> scene -> project.
+Style extractions: one job row per extraction request (ADR-0013 B4a-fix).
 Category packs: 3 builtin packs seeded from infra/seeds/category_packs/.
 "장르시트" is the user's alias for this table.
 """
@@ -43,6 +44,35 @@ class StyleKit(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class StyleExtraction(Base):
+    """One style-extraction request = one stable job row (plan D9, ADR-0013).
+
+    The id is the single Celery task argument (ADR-0008). For a project kit
+    the id equals the cost-ledger generation's id (job_type style_extract),
+    so /jobs/{id} retry/cancel address the same logical job; a global kit
+    (project_id NULL) has no ledger and this row is its only guard.
+    `source_ids` is the input snapshot applied by THIS extraction.
+    Status: queued -> running -> succeeded | failed | canceled. The worker
+    claims queued -> running and finishes in the same transaction, so a
+    redelivered or duplicate message for a terminal row is a no-op.
+    """
+
+    __tablename__ = "style_extractions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    style_kit_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("style_kits.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    source_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CategoryPack(Base):

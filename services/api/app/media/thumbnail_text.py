@@ -5,24 +5,24 @@ after the image bytes are generated. Canvas is 1280x720 (16:9); the generated
 image is cover-fit onto the canvas, then an optional bottom band with the
 centered title text is drawn.
 
-Font notes: DejaVu Sans Bold for Latin text; Noto Sans CJK for CJK text
-(Korean titles are the common case). Both ship with the system fonts here;
+Font notes: First existing entry of defaults.LATIN_FONT_CANDIDATES / CJK_FONT_CANDIDATES
+(Korean titles are the common case; the Docker image ships fonts-noto-cjk);
 when neither loads, Pillow's built-in bitmap font is the last resort.
 """
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from app.core import defaults
 from app.core.errors import ErrorCode, StudioError
 
 THUMB_W = 1280
 THUMB_H = 720
 _BAND_H = 190
 
-_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-_NOTO_CJK = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 
 def _needs_cjk(text: str) -> bool:
@@ -33,9 +33,14 @@ def _load_font(size: int, cjk: bool):
     """Best-effort font loading; never raises."""
     candidates: list[tuple[str, dict]] = []
     if cjk:
-        # .ttc collection: try the first few faces (JP/HK/KR/CN/TW order varies).
-        candidates += [(_NOTO_CJK, {"index": i}) for i in range(5)]
-    candidates.append((_DEJAVU_BOLD, {}))
+        # First existing candidate; .ttc collections: try the first few faces
+        # (JP/HK/KR/CN/TW order varies).
+        cjk_path = next((p for p in defaults.CJK_FONT_CANDIDATES if Path(p).exists()), None)
+        if cjk_path:
+            candidates += [(cjk_path, {"index": i}) for i in range(5)]
+    latin_path = next((p for p in defaults.LATIN_FONT_CANDIDATES if Path(p).exists()), None)
+    if latin_path:
+        candidates.append((latin_path, {}))
     for path, kw in candidates:
         try:
             return ImageFont.truetype(path, size=size, **kw)

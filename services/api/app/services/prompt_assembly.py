@@ -114,16 +114,42 @@ def _get_shot(db: Session, shot_id: uuid.UUID):
     return shot
 
 
-def _resolve_style_kit(db: Session, shot, scene):
-    """Shot -> scene -> project default style kit (first non-null wins)."""
+def _resolve_style_kit(db: Session, shot, scene, project=None):
+    """Style authority (ADR-0011 §13, audit F15/P12).
+
+    A LOCKED project kit is the single style authority: shot/scene kits
+    cannot replace it. Otherwise shot -> scene -> project default (first
+    non-null wins).
+    """
     from app.models.style import StyleKit
 
+    project_kit = None
+    if project is not None and getattr(project, "style_kit_id", None):
+        project_kit = db.get(StyleKit, project.style_kit_id)
+    if project_kit is not None and project_kit.is_locked:
+        return project_kit
     for kit_id in (shot.style_kit_id, scene.style_kit_id if scene else None):
         if kit_id:
             kit = db.get(StyleKit, kit_id)
             if kit is not None:
                 return kit
-    return None
+    return project_kit
+
+
+def _locked_slots(kit) -> list[str]:
+    """Slots that carry a locked kit's verbatim tokens (ADR-0011 §13)."""
+    if kit is None or not kit.is_locked:
+        return []
+    slots = []
+    if kit.texture or kit.composition:
+        slots.append("style_medium")
+    if kit.lighting:
+        slots.append("lighting")
+    if getattr(kit, "lens", None):
+        slots.append("camera_lens")
+    if kit.color:
+        slots.append("color_mood")
+    return slots
 
 
 def _slot_style_medium(kit) -> str:
@@ -260,7 +286,8 @@ def assemble_shot_prompt(
     slots: dict[str, str] = {}
     slot_meta: dict[str, dict[str, str]] = {}
 
-    kit = _resolve_style_kit(db, shot, scene)
+    kit = _resolve_style_kit(db, shot, scene, project)
+    locked_slots = _locked_slots(kit)
     bg_cue, medium_cue = _slot_category_medium(db, project)
 
     # Slot 1: subject — action + character identity. The face is NEVER
@@ -270,6 +297,7 @@ def assemble_shot_prompt(
     subject_lines: list[str] = []
     negatives: list[str] = []
     ref_images: list[tuple[str, str, str, str]] = []  # (priority, kind, rel_path, ref_id)
+    ref_weights: dict[str, float] = {}  # identity strength per character ref path
 
     shot_refs = db.query(ShotReference).filter(ShotReference.shot_id == shot.id).all()
     outfit_ref = next(
@@ -285,6 +313,8 @@ def assemble_shot_prompt(
         primary = _primary_reference(db, char.id)
         if primary is not None:
             ref_images.append(("primary", "character", primary.image_path, str(primary.id)))
+            if getattr(char, "default_strength", None) is not None:
+                ref_weights[primary.image_path] = float(char.default_strength)
         # Wardrobe fragment belongs to the subject (what the character wears).
         from app.models.character import CharacterWardrobe
 
@@ -399,7 +429,19 @@ def assemble_shot_prompt(
     # Slot 7: params — model-specific trailing tokens.
     slots["params"] = _slot_params(model_id, shot)
 
-    # Apply overrides (replace or delete slots).
+    # Apply overrides (replace or delete slots). A locked kit's slots are
+    # neither replaceable nor removable (ADR-0011 §13): reject, never drop.
+    blocked = sorted(
+        name for name, value in overrides.items()
+        if name in locked_slots and (value or "") != slots.get(name, "")
+    )
+    if blocked:
+        raise StudioError(
+            ErrorCode.STYLE_KIT_LOCKED,
+            "The project's style kit is locked; its slots cannot be overridden. "
+            "Duplicate the kit to change the look.",
+            details={"slots": blocked, "style_kit_id": str(kit.id)},
+        )
     for name, value in overrides.items():
         if name in slots:
             slots[name] = value or ""
@@ -435,13 +477,14 @@ def assemble_shot_prompt(
             slots["setting"] = ""
             truncated.append("setting")
             prompt = _join()
-    if len(prompt) > max_chars:
+    # A locked kit's tokens are never truncated away (ADR-0011 §13).
+    if len(prompt) > max_chars and "style_medium" not in locked_slots:
         core = slot_meta.get("style_medium", {}).get("core", "")
         if slots.get("style_medium") and core != slots["style_medium"]:
             slots["style_medium"] = core
             truncated.append("style_medium:details")
             prompt = _join()
-    if len(prompt) > max_chars:
+    if len(prompt) > max_chars and "camera_lens" not in locked_slots:
         core = slot_meta.get("camera_lens", {}).get("core", "")
         if slots.get("camera_lens") and core != slots["camera_lens"]:
             slots["camera_lens"] = core
@@ -476,6 +519,13 @@ def assemble_shot_prompt(
         "reference_ids": ref_id_snapshot,
         "style_kit_id": kit.id if kit else None,
         "style_kit_version": kit.version if kit else None,
+        "style_kit_locked": bool(kit is not None and kit.is_locked),
+        # Resolved references with roles (ADR-0014 contract snapshot).
+        "references": [
+            {"role": prio, "kind": kind, "path": path, "ref_id": ref_id,
+             "weight": ref_weights.get(path)}
+            for prio, kind, path, ref_id in kept
+        ],
         "truncated_sections": truncated,
         "sections": {k: v for k, v in slots.items()},
         "estimated_tokens": estimated_tokens,

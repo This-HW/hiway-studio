@@ -37,16 +37,13 @@ export default function CharacterSheetPage() {
 
   // Watch SSE completions for pending sheet jobs.
   useEffect(() => {
-    for (const jobId of s.pendingJobIds) {
-      const job = jobs[jobId];
-      if (!job) continue;
-      if (job.status === "completed") {
-        s.markJobDone(jobId, false);
-      } else if (job.status === "failed") {
-        s.markJobDone(jobId, true);
-        toast(`시트 이미지 생성 실패: ${job.error_code ?? "알 수 없는 오류"}`, {
+    for (const r of s.settlePendingJobs(jobs)) {
+      if (r.status === "failed") {
+        toast(`시트 이미지 생성 실패: ${r.errorCode ?? "알 수 없는 오류"}`, {
           kind: "error",
         });
+      } else {
+        toast("시트 이미지 생성이 취소되었습니다.");
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -67,9 +64,9 @@ export default function CharacterSheetPage() {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div className="row">
-            {s.character?.master_thumbnail_url ? (
+            {s.character?.master_thumbnail ? (
               <img
-                src={s.character.master_thumbnail_url}
+                src={resolveFileUrl(s.character.master_thumbnail) ?? undefined}
                 alt=""
                 style={{
                   width: 56,

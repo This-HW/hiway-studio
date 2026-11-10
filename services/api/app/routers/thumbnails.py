@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -24,25 +25,18 @@ router = APIRouter(tags=["thumbnails"])
 def create_thumbnails(
     project_id: uuid.UUID,
     body: ThumbnailRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> ThumbnailAcceptedResponse:
-    route = "POST /projects/{project_id}/thumbnails"
-    store = idempotency.get_store()
-    key = store.make_key(route, idempotency_key) if idempotency_key else None
-    if key is not None:
-        hit = store.recall(key)
-        if hit is not None:
-            return ThumbnailAcceptedResponse.model_validate(hit)
+) -> JSONResponse:
     count = body.count if body.count is not None else DEFAULT_COUNT
-    result = thumbnail_service.request_thumbnails(
-        db,
-        project_id,
-        timeline_id=body.timeline_id,
-        title_text=body.title_text,
-        count=count,
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=ThumbnailAcceptedResponse,
+        create=lambda: thumbnail_service.request_thumbnails(
+            db,
+            project_id,
+            timeline_id=body.timeline_id,
+            title_text=body.title_text,
+            count=count,
+        ),
     )
-    response = ThumbnailAcceptedResponse.model_validate(result)
-    if key is not None:
-        store.remember(key, response.model_dump(mode="json"))
-    return response

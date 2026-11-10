@@ -4,7 +4,8 @@ from __future__ import annotations
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.core.errors import ErrorCode, StudioError
@@ -25,6 +26,7 @@ from app.schemas.character import (
 )
 from app.services import character as character_service
 from app.services import character_pipeline
+from app.services import idempotency
 
 router = APIRouter(tags=["characters"])
 
@@ -105,18 +107,25 @@ def delete_character(character_id: uuid.UUID, db: Session = Depends(get_db)) -> 
 def generate_master(
     character_id: uuid.UUID,
     body: MasterGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
-) -> JobAcceptedResponse:
+    idempotency_key: str | None = Header(default=None),
+) -> JSONResponse:
     character = character_service.get_character(db, character_id)
     if character.project_id is None:
         raise StudioError(
             ErrorCode.VALIDATION_ERROR,
             "Master generation for a global character needs a project context (Phase 2).",
         )
-    job_id = character_pipeline.enqueue_master(
-        db, character, body.prompt, body.model_id, character.project_id
+    # Same DB idempotency as every other job-creating route (D2, review B5-M1).
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=JobAcceptedResponse,
+        create=lambda: {
+            "job_id": character_pipeline.enqueue_master(
+                db, character, body.prompt, body.model_id, character.project_id
+            )
+        },
     )
-    return JobAcceptedResponse(job_id=job_id)
 
 
 @router.post("/characters/{character_id}/sheet",
@@ -124,18 +133,29 @@ def generate_master(
 def generate_sheet(
     character_id: uuid.UUID,
     body: SheetGenerateRequest,
+    request: Request,
     db: Session = Depends(get_db),
-) -> SheetGenerateResponse:
+    idempotency_key: str | None = Header(default=None),
+) -> JSONResponse:
     character = character_service.get_character(db, character_id)
     if character.project_id is None:
         raise StudioError(
             ErrorCode.VALIDATION_ERROR,
             "Sheet generation for a global character needs a project context (Phase 2).",
         )
-    job_ids, estimated = character_pipeline.enqueue_sheet(
-        db, character, character.project_id, body.views, body.expressions, body.outfits, body.poses
+
+    def _create() -> dict:
+        job_ids, estimated = character_pipeline.enqueue_sheet(
+            db, character, character.project_id,
+            body.views, body.expressions, body.outfits, body.poses,
+        )
+        return {"job_ids": job_ids, "estimated_cost_usd": estimated}
+
+    # Same DB idempotency as every other job-creating route (D2, review B5-M1).
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=SheetGenerateResponse,
+        create=_create,
     )
-    return SheetGenerateResponse(job_ids=job_ids, estimated_cost_usd=estimated)
 
 
 @router.get("/characters/{character_id}/references", response_model=list[ReferenceRead])
@@ -201,29 +221,22 @@ from app.services import idempotency, lora as lora_service
 def train_lora(
     character_id: uuid.UUID,
     body: LoraTrainRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> LoraTrainAcceptedResponse:
-    route = "POST /characters/{character_id}/lora/train"
-    store = idempotency.get_store()
-    key = store.make_key(route, idempotency_key) if idempotency_key else None
-    if key is not None:
-        hit = store.recall(key)
-        if hit is not None:
-            return LoraTrainAcceptedResponse.model_validate(hit)
-    result = lora_service.request_train(
-        db,
-        character_id,
-        training_image_ids=body.training_image_ids,
-        rank=body.rank,
-        steps=body.steps,
-        trigger_word=body.trigger_word,
-        confirm=body.confirm,
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=LoraTrainAcceptedResponse,
+        create=lambda: lora_service.request_train(
+            db,
+            character_id,
+            training_image_ids=body.training_image_ids,
+            rank=body.rank,
+            steps=body.steps,
+            trigger_word=body.trigger_word,
+            confirm=body.confirm,
+        ),
     )
-    response = LoraTrainAcceptedResponse.model_validate(result)
-    if key is not None:
-        store.remember(key, response.model_dump(mode="json"))
-    return response
 
 
 @router.get("/characters/{character_id}/loras", response_model=list[LoraModelRead])

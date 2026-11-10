@@ -32,7 +32,13 @@ def resolve(relative_path: str) -> Path:
     rel = Path(relative_path)
     if rel.is_absolute() or ".." in rel.parts:
         raise StudioError(ErrorCode.VALIDATION_ERROR, "Invalid stored path.")
-    return projects_root() / rel
+    root = projects_root()
+    # Follow symlinks (strict=False: the target may not exist yet) and require
+    # the real location to stay inside PROJECTS_ROOT.
+    resolved = (root / rel).resolve()
+    if not resolved.is_relative_to(root):
+        raise StudioError(ErrorCode.VALIDATION_ERROR, "Invalid stored path.")
+    return resolved
 
 
 def assert_relative(path: str) -> str:

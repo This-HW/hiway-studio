@@ -19,6 +19,9 @@ class QCCheckOut(BaseModel):
     measured: Any = None
     threshold: Any = None
     stub: bool = False
+    # False = check not applicable to this run (e.g. encoding_match before
+    # render); excluded from the verdict and the counts.
+    applicable: bool = True
 
 
 class QCReportOut(BaseModel):
