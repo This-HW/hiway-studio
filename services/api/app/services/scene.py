@@ -177,7 +177,10 @@ def update_shot(db: Session, shot_id: uuid.UUID, fields: dict[str, Any]) -> Shot
             > 0
         )
         if has_takes:
-            shot.frame_stale = True
+            # Bumps frame_stale_rev in the same UPDATE (also on an already
+            # stale shot), so an in-flight frame enqueue that snapshotted the
+            # old revision cannot clear the flag afterwards (B4R4-M1, R5-M1).
+            shot.mark_frame_stale()
     db.flush()
     return shot
 
@@ -281,9 +284,13 @@ def add_reference(
     return ref
 
 
-def delete_reference(db: Session, reference_id: uuid.UUID) -> None:
+def delete_reference(db: Session, shot_id: uuid.UUID, reference_id: uuid.UUID) -> None:
+    """Delete a shot reference that belongs to `shot_id` (ADR-0012).
+
+    A reference of another shot (or a character-reference id) is NOT_FOUND
+    under this shot, so the route can never delete across shots."""
     ref = db.get(ShotReference, reference_id)
-    if ref is None:
+    if ref is None or ref.shot_id != shot_id:
         raise StudioError(ErrorCode.NOT_FOUND, "Shot reference not found.")
     db.delete(ref)
     db.flush()

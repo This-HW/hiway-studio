@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -27,23 +28,14 @@ router = APIRouter(tags=["multishots"])
 def create_multishot(
     shot_id: uuid.UUID,
     body: MultishotRequest,
+    request: Request,
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None),
-) -> MultishotAcceptedResponse:
-    route = "POST /shots/{shot_id}/multishot"
-    store = idempotency.get_store()
-    key = store.make_key(route, idempotency_key) if idempotency_key else None
-    if key is not None:
-        hit = store.recall(key)
-        if hit is not None:
-            return MultishotAcceptedResponse.model_validate(hit)
-    result = multishot_service.request_coverage(
-        db, shot_id, model_id=body.model_id
+) -> JSONResponse:
+    return idempotency.run(
+        db, request, idempotency_key, body=body, response_model=MultishotAcceptedResponse,
+        create=lambda: multishot_service.request_coverage(db, shot_id, model_id=body.model_id),
     )
-    response = MultishotAcceptedResponse.model_validate(result)
-    if key is not None:
-        store.remember(key, response.model_dump(mode="json"))
-    return response
 
 
 @router.get("/multishot-sets/{set_id}", response_model=MultishotSetRead)

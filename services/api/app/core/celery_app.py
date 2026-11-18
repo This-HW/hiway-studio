@@ -32,6 +32,11 @@ celery_app.conf.update(
         "q.p1.*": {"queue": "q.post"},
     },
     task_acks_late=True,
+    # A worker killed mid-task (OOM, SIGKILL) must not ACK the message: it is
+    # redelivered, and the row-level claim decides what happens (ADR-0013
+    # ACK/redelivery table: queued -> claim, terminal -> no-op ACK, live
+    # running duplicate -> no provider call, expired running -> reconcile).
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     task_track_started=True,
 )

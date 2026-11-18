@@ -5,16 +5,34 @@ All provider HTTP is faked with httpx.MockTransport — no real network calls.
 from __future__ import annotations
 
 import base64
+import io
 import json
 from decimal import Decimal
 
 import httpx
 import pytest
+from PIL import Image
 
 from app.core import defaults
 from app.core.errors import ErrorCode, StudioError
 from app.models_lib import registry
-from app.models_lib.adapters.http_polling import HttpPollingAdapter, poll_until_done
+from app.models_lib.adapters.http_polling import (
+    HttpPollingAdapter,
+    poll_until_done,
+    remote_job_id,
+)
+
+
+# Results must be real media (magic bytes + Pillow decode, ADR-0014 / audit
+# P16, B7-r2 M3): a real, decodable PNG. Tests append a marker after IEND to
+# tell results apart (still a decodable image).
+def _real_png() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_PNG = _real_png()
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +123,7 @@ class _FakeProvider:
             ]
             return httpx.Response(200, json=seq[min(self.polls - 1, 2)])
         if request.url.host == "cdn.test":
-            return httpx.Response(200, content=b"\x89PNG-FAKE-BYTES")
+            return httpx.Response(200, content=_PNG + b"-FAKE-BYTES")
         if path == "/v1/jobs/job-1/cancel":
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"error": "not found"})
@@ -132,7 +150,7 @@ def test_submit_poll_fetch_result_end_to_end(monkeypatch):
     adapter = _install(monkeypatch, _model(), fake)
 
     job_id = adapter.submit("fake.t2i", {"prompt": "a cat", "width": 1024, "height": 768, "seed": 42})
-    assert job_id == "job-1"
+    assert remote_job_id(job_id) == "job-1"  # submit returns a local handle (B7-r3 M5)
 
     # submit: headers resolved from env, placeholders substituted with types kept
     req = fake.requests[0]
@@ -153,7 +171,7 @@ def test_submit_poll_fetch_result_end_to_end(monkeypatch):
     assert s3.progress_pct == 100.0
     assert s3.output_urls == ["https://cdn.test/out.png"]
 
-    assert adapter.fetch_result(job_id) == b"\x89PNG-FAKE-BYTES"
+    assert adapter.fetch_result(job_id) == _PNG + b"-FAKE-BYTES"
 
 
 def test_poll_until_done_uses_shared_loop(monkeypatch):
@@ -191,6 +209,16 @@ def test_unmapped_provider_state_stays_running(monkeypatch):
         return httpx.Response(200, json={"state": "MYSTERIOUS"})
 
     adapter = _install(monkeypatch, _model(), handler)
+    job_id = adapter.submit("fake.t2i", _payload())
+    # ADR-0014: an unmapped state is an error by default (no "running forever").
+    with pytest.raises(StudioError) as ei:
+        adapter.poll(job_id)
+    assert ei.value.details["reason"] == "status_unrecognized"
+
+    # Explicit seed opt-in keeps polling with the raw state surfaced.
+    http = _http_config()
+    http["status"] = dict(http["status"], unknown_state="running")
+    adapter = _install(monkeypatch, _model(http=http), handler)
     job_id = adapter.submit("fake.t2i", _payload())
     status = adapter.poll(job_id)
     assert status.state == "running"
@@ -383,20 +411,20 @@ def test_result_from_separate_endpoint(monkeypatch):
         if request.url.path == "/v1/jobs/job-1/result":
             return httpx.Response(200, json={"images": [{"url": "https://cdn.test/r.png"}]})
         if request.url.host == "cdn.test":
-            return httpx.Response(200, content=b"RESULT-BYTES")
+            return httpx.Response(200, content=_PNG + b"RESULT-BYTES")
         return httpx.Response(404, json={})
 
     adapter = _install(monkeypatch, _model(http=http), handler)
     job_id = adapter.submit("fake.t2i", _payload())
     assert adapter.poll(job_id).state == "succeeded"
-    assert adapter.fetch_result(job_id) == b"RESULT-BYTES"
+    assert adapter.fetch_result(job_id) == _PNG + b"RESULT-BYTES"
 
 
 def test_result_inline_base64_bytes(monkeypatch):
     monkeypatch.setenv("FAKE_API_KEY", "x")
     http = _http_config()
     http["result"] = {"output_bytes_path": "image_b64"}
-    raw = base64.b64encode(b"INLINE-BYTES").decode()
+    raw = base64.b64encode(_PNG + b"INLINE-BYTES").decode()
     data_uri = f"data:image/png;base64,{raw}"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -409,7 +437,7 @@ def test_result_inline_base64_bytes(monkeypatch):
     adapter = _install(monkeypatch, _model(http=http), handler)
     job_id = adapter.submit("fake.t2i", _payload())
     assert adapter.poll(job_id).state == "succeeded"
-    assert adapter.fetch_result(job_id) == b"INLINE-BYTES"
+    assert adapter.fetch_result(job_id) == _PNG + b"INLINE-BYTES"
 
 
 def test_comfyui_seed_shape(monkeypatch):
@@ -459,12 +487,12 @@ def test_comfyui_seed_shape(monkeypatch):
             return httpx.Response(200, json={"p1": entry})
         if request.url.path == "/view":
             assert request.url.params["filename"] == "a.png"
-            return httpx.Response(200, content=b"COMFY-BYTES")
+            return httpx.Response(200, content=_PNG + b"COMFY-BYTES")
         return httpx.Response(404, json={})
 
     adapter = _install(monkeypatch, _model(http=http, model_id="comfy.t2i"), handler)
     job_id = adapter.submit("comfy.t2i", {"prompt": "x", "seed": 7})
-    assert job_id == "p1"
+    assert remote_job_id(job_id) == "p1"
 
     running = adapter.poll(job_id)
     assert running.state == "running"  # completed=false -> running
@@ -473,7 +501,7 @@ def test_comfyui_seed_shape(monkeypatch):
     assert done.output_urls == [
         "http://127.0.0.1:8188/view?filename=a.png&subfolder=&type=output"
     ]
-    assert adapter.fetch_result(job_id) == b"COMFY-BYTES"
+    assert adapter.fetch_result(job_id) == _PNG + b"COMFY-BYTES"
 
 
 # ---------------------------------------------------------------------------
@@ -545,20 +573,20 @@ def test_comfyui_seed_http_sequence(monkeypatch):
         if req.url.path == "/view":
             assert dict(req.url.params) == {
                 "filename": "studio_00001_.png", "subfolder": "", "type": "output"}
-            return httpx.Response(200, content=b"\x89PNG-REAL")
+            return httpx.Response(200, content=_PNG + b"-REAL")
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
     pid = adapter.submit("comfyui.t2i-sd15",
                          {"prompt": "a cat", "width": 512, "height": 512, "seed": 7})
-    assert pid == prompt_id
+    assert remote_job_id(pid) == prompt_id
     done = poll_until_done(adapter, pid)
     assert done.state == "succeeded"
     assert done.output_urls == [
         "http://127.0.0.1:8188/view"
         "?filename=studio_00001_.png&subfolder=&type=output"
     ]
-    assert adapter.fetch_result(pid) == b"\x89PNG-REAL"
+    assert adapter.fetch_result(pid) == _PNG + b"-REAL"
 
 
 def test_comfyui_seed_queued_then_failed(monkeypatch):
@@ -649,7 +677,7 @@ def test_upload_stage_substitutes_filename(monkeypatch, tmp_path):
     adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
     pid = adapter.submit("test.upload-model",
                          {"prompt": "a cat", "init_image": str(init)})
-    assert pid == "job-1"
+    assert remote_job_id(pid) == "job-1"
     assert seen == ["/upload/image", "/v1/generate"]  # upload runs BEFORE submit
 
 
@@ -669,7 +697,7 @@ def test_upload_skipped_without_input(monkeypatch):
         return httpx.Response(200, json={"id": "job-2"})
 
     adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
-    assert adapter.submit("test.upload-model", {"prompt": "a cat"}) == "job-2"
+    assert remote_job_id(adapter.submit("test.upload-model", {"prompt": "a cat"})) == "job-2"
     assert seen == ["/v1/generate"]
 
 
@@ -735,14 +763,14 @@ def test_base_url_follows_submit_env(monkeypatch):
                     {"filename": "studio_00001_.png", "subfolder": "",
                      "type": "output"}]}}}})
         if req.url.path == "/view":
-            return httpx.Response(200, content=b"\x89PNG-REAL")
+            return httpx.Response(200, content=_PNG + b"-REAL")
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
     pid = adapter.submit("comfyui.t2i-sd15",
                          {"prompt": "a cat", "width": 512, "height": 512, "seed": 7})
     assert poll_until_done(adapter, pid).state == "succeeded"
-    assert adapter.fetch_result(pid) == b"\x89PNG-REAL"
+    assert adapter.fetch_result(pid) == _PNG + b"-REAL"
     assert hosts == {"gpu-box"}  # every stage followed the new machine
 
 
@@ -793,16 +821,16 @@ def test_comfyui_i2i_seed_upload_sequence(monkeypatch, tmp_path):
         if req.url.path == "/view":
             assert dict(req.url.params) == {
                 "filename": "studio_00001_.png", "subfolder": "", "type": "output"}
-            return httpx.Response(200, content=b"\x89PNG-I2I")
+            return httpx.Response(200, content=_PNG + b"-I2I")
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     adapter = HttpPollingAdapter(transport=httpx.MockTransport(handler))
     pid = adapter.submit("comfyui.i2i-sd15",
                          {"prompt": "a cat", "seed": 7, "init_image": str(init)})
-    assert pid == prompt_id
+    assert remote_job_id(pid) == prompt_id
     assert seen[0] == "/upload/image"  # upload precedes submit
     assert poll_until_done(adapter, pid).state == "succeeded"
-    assert adapter.fetch_result(pid) == b"\x89PNG-I2I"
+    assert adapter.fetch_result(pid) == _PNG + b"-I2I"
 
 
 def test_worker_payload_satisfies_real_comfyui_t2i_seed(monkeypatch):

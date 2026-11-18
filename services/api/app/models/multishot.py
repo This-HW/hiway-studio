@@ -47,6 +47,11 @@ class MultishotSet(Base):
     # bindings, scene context (location/time/mood/lighting), model id.
     state_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    # Last broker dispatch of q.p1.run_multishot (reconcile clock while the
+    # set is still queued, ADR-0013 / plan D9).
+    dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -84,4 +89,8 @@ class MultishotFrame(Base):
         UniqueConstraint(
             "multishot_set_id", "coverage_type", name="uq_multishot_frame_angle"
         ),
+        # Plan D9 (RH2): a frame links to exactly one child shot/generation and
+        # no two frames share one — a duplicate fan-out cannot re-link rows.
+        UniqueConstraint("generation_id", name="uq_multishot_frame_generation"),
+        UniqueConstraint("shot_id", name="uq_multishot_frame_shot"),
     )

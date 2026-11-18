@@ -8,6 +8,7 @@ creates the CharacterReference row — see the CONTRACT comment below.
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -63,8 +64,15 @@ def enqueue_master(
     Global characters generate inside the requesting project's context.
     """
     chosen_model = _choose_model(db, model_id)
-    from app.services import budget_guard, cost_estimator
+    from app.services import budget_guard, cost_estimator, provider_input
 
+    # ADR-0014: seed drawn AND persisted at enqueue (reproducible), resolved
+    # provider inputs snapshotted; capability pre-check before the budget.
+    seed = provider_input.draw_seed()
+    snapshot = provider_input.image_snapshot(
+        db, model_id=chosen_model, task="text_to_image", seed=seed,
+        seed_source="random", negative_prompt=character.negative_prompt,
+    )
     cost = cost_estimator.estimate_images(db, chosen_model, 1)
     budget_guard.check_budget(db, project_id, estimated_new=cost)  # 403 BUDGET_EXCEEDED
     gen = Generation(
@@ -78,9 +86,11 @@ def enqueue_master(
             "_reference_role": "master",
             "_source": "generated",
             "_character_dir": _character_dir(character),
+            "snapshot": snapshot,
         },
         prompt_final=prompt or character.appearance_prompt,
         negative_final=character.negative_prompt,
+        seed=seed,
         estimated_cost_usd=cost,
     )
     db.add(gen)
@@ -103,14 +113,34 @@ def enqueue_sheet(
     One job per requested item; each job writes one reference image and one
     CharacterReference row on completion. Returns (job_ids, estimated_cost_usd).
     """
-    from decimal import Decimal
 
-    from app.services import budget_guard, cost_estimator
+    from app.services import budget_guard, cost_estimator, provider_input
 
     jobs: list[uuid.UUID] = []
     total = Decimal("0")
 
     chosen_model = _choose_model(db, None)
+    # ADR-0014 / audit F08: the approved master (primary reference) is the
+    # identity reference of every sheet job. Pre-check before the budget.
+    master = (
+        db.query(CharacterReference)
+        .filter(
+            CharacterReference.character_id == character.id,
+            CharacterReference.is_primary.is_(True),
+        )
+        .order_by(CharacterReference.created_at.desc())
+        .first()
+    )
+    identity = (
+        [{"path": master.image_path, "role": "identity", "kind": "character",
+          "ref_id": str(master.id)}]
+        if master is not None else []
+    )
+    snapshot = provider_input.image_snapshot(
+        db, model_id=chosen_model, task="text_to_image",
+        seed=provider_input.draw_seed(), seed_source="random",
+        negative_prompt=character.negative_prompt, references=identity,
+    )
     unit_cost = cost_estimator.estimate_images(db, chosen_model, 1)
     item_count = (
         len(views or []) + len(expressions or []) + len(outfits or []) + len(poses or [])
@@ -121,6 +151,7 @@ def enqueue_sheet(
     def _enqueue(role: str, item_prompt: str) -> None:
         nonlocal total
         total += unit_cost
+        seed = provider_input.draw_seed()  # persisted per job (reproducible)
         gen = Generation(
             id=uuid.uuid4(),
             project_id=project_id,
@@ -132,9 +163,11 @@ def enqueue_sheet(
                 "_reference_role": role,
                 "_source": "sheet_derived",
                 "_character_dir": _character_dir(character),
+                "snapshot": provider_input.with_seed(snapshot, seed),
             },
             prompt_final=f"{character.appearance_prompt}, {item_prompt}",
             negative_final=character.negative_prompt,
+            seed=seed,
             estimated_cost_usd=unit_cost,
         )
         db.add(gen)

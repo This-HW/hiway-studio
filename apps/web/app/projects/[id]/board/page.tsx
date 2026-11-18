@@ -8,6 +8,8 @@ import { Modal } from "@/components/Modal";
 import { apiGet, apiPost } from "@/lib/api-client";
 import { ApiError } from "@/lib/errors";
 import { resolveFileUrl } from "@/lib/files";
+import { koreanErrorMessage } from "@/lib/format";
+import { isRetryableFailure } from "@/lib/jobs-api";
 import type { GenerationJob, Scene, Shot } from "@/lib/types";
 import { SHOT_REFERENCE_PURPOSES } from "@/lib/types";
 import { useBoardStore } from "@/stores/board";
@@ -123,6 +125,16 @@ function TakeGrid({ shotId }: { shotId: string }) {
   const [inpaintMask, setInpaintMask] = useState("");
   const [outpaintFor, setOutpaintFor] = useState<string | null>(null);
   const [outpaintPrompt, setOutpaintPrompt] = useState("");
+  // Take ids with a retry/cancel request in flight (no double submit). An
+  // accepted cancel stays disabled: the card keeps the server's state until
+  // job.canceled / a durable read settles the take and the list reloads.
+  const [acting, setActing] = useState<Record<string, boolean>>({});
+  const runJobAction = (id: string, action: () => Promise<boolean>, keepOnSuccess: boolean) => {
+    setActing((a) => ({ ...a, [id]: true }));
+    void action().then((ok) => {
+      if (!ok || !keepOnSuccess) setActing((a) => ({ ...a, [id]: false }));
+    });
+  };
 
   if (takes.length === 0) return <p style={{ color: "var(--muted)" }}>테이크가 없습니다.</p>;
   return (
@@ -143,6 +155,11 @@ function TakeGrid({ shotId }: { shotId: string }) {
               {t.job_type} · {t.status}
               {t.batch_index != null && ` · take ${t.batch_index + 1}`}
             </div>
+            {t.status === "failed" && t.error_code && (
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                {koreanErrorMessage(t.error_code, t.error_message ?? t.error_code)}
+              </div>
+            )}
             <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
               {t.status === "succeeded" && !approved && (
                 <button className="btn btn-primary" style={{ fontSize: 12, padding: "2px 8px" }} onClick={() => void s.approve(shotId, t.id)}>
@@ -150,6 +167,26 @@ function TakeGrid({ shotId }: { shotId: string }) {
                 </button>
               )}
               {approved && <span className="badge green">승인됨</span>}
+              {t.status === "failed" && isRetryableFailure(t.error_code) && (
+                <button
+                  className="btn"
+                  style={{ fontSize: 12, padding: "2px 8px" }}
+                  disabled={acting[t.id]}
+                  onClick={() => runJobAction(t.id, () => s.retryTake(shotId, t), false)}
+                >
+                  재시도
+                </button>
+              )}
+              {(t.status === "queued" || t.status === "running") && (
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 12, padding: "2px 8px" }}
+                  disabled={acting[t.id]}
+                  onClick={() => runJobAction(t.id, () => s.cancelTake(shotId, t), true)}
+                >
+                  {acting[t.id] ? "취소 요청됨" : "취소"}
+                </button>
+              )}
               {t.status === "succeeded" && (
                 <>
                   <button className="btn btn-ghost" style={{ fontSize: 12, padding: "2px 8px" }} onClick={() => void s.upscale(shotId, t.id)}>
@@ -472,6 +509,9 @@ export default function BoardPage() {
     for (const shotId of Object.keys(st.pendingTakes)) {
       if (st.takesSettled(shotId, jobs)) st.handleTakesSettled(shotId);
     }
+    // Cards changed from elsewhere (header retry/cancel, B10-M1).
+    const ws = useWorkspaceStore.getState();
+    st.syncTakesWithJobs(ws.jobs, ws.jobRev);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventSeq]);
 

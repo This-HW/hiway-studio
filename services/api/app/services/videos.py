@@ -186,9 +186,10 @@ def enqueue_video(
     db.add(video)
     db.flush()
 
-    check_enum("shot_status", "video_generating")
-    shot.status = "video_generating"
-    db.flush()
+    # Pending transition: the shot is locked last (after the new rows) and
+    # recomputed from the current jobs, even when it already looks
+    # video_generating (R2-H1).
+    mark_video_shot_pending(db, shot.id)
 
     dispatch_after_commit(db, lambda: dispatch_job("q.video.run_generation", str(gen.id)))
     return {
@@ -221,3 +222,134 @@ def latest_done_video(db: Session, shot_id: uuid.UUID):
         .order_by(Video.created_at.desc())
         .first()
     )
+
+
+# --- job lifecycle hooks (ADR-0013: worker / cancel / retry / reconcile) ------
+
+
+def _video_of(db: Session, gen):
+    from app.models.generation import Video
+
+    return (
+        db.query(Video)
+        .filter(Video.generation_id == gen.id)
+        .order_by(Video.created_at.desc())
+        .first()
+    )
+
+
+def mark_video_failed(db: Session, gen) -> None:
+    """A video job ended without a clip: its generating Video row fails too."""
+    video = _video_of(db, gen)
+    if video is not None and video.status == "generating":
+        video.status = "failed"
+        video.error_code = gen.error_code
+        video.error_message = gen.error_message
+        db.flush()
+
+
+def recompute_shot_video_status(db: Session, shot_id: uuid.UUID) -> bool:
+    """Recompute the shot status once no video job is pending.
+
+    A finished clip never demotes the shot below what the approved frame
+    already earned: failure without any done clip falls back to
+    frame_approved (the frame is still usable for a retry). The shot row is
+    locked before pending jobs are counted, so concurrent terminal commits
+    of two video jobs of one shot cannot both see the other as pending
+    (lock order: generation -> Video -> Shot, ADR-0013 B4a-fix). Returns True
+    when the status changed.
+    """
+    from app.models.generation import Generation, Video
+    from app.models.production import Shot
+    from app.services.generations import lock_row
+
+    shot = lock_row(db, Shot, shot_id)
+    if shot is None:
+        return False
+    pending = (
+        db.query(Generation)
+        .filter(
+            Generation.shot_id == shot.id,
+            Generation.job_type.in_(("image_to_video", "text_to_video", "video_extend")),
+            Generation.status.in_(("queued", "running")),
+        )
+        .count()
+    )
+    if pending:
+        return False
+    done_clips = (
+        db.query(Video)
+        .filter(Video.shot_id == shot.id, Video.status == "done")
+        .count()
+    )
+    if done_clips:
+        next_status = "video_done"
+    elif shot.approved_frame_generation_id:
+        next_status = "frame_approved"
+    else:
+        next_status = "failed"
+    changed = shot.status != next_status
+    if changed:
+        check_enum("shot_status", next_status)
+        shot.status = next_status
+    db.flush()
+    return changed
+
+
+# Shot statuses reconcile leaves alone when a video job is pending: already
+# right, or owned by a pending frame take (enqueue/retry move any status).
+VIDEO_PENDING_KEEP = ("video_generating", "frame_generating")
+
+
+def mark_video_shot_pending(
+    db: Session, shot_id: uuid.UUID, *, keep: tuple[str, ...] = ("video_generating",)
+) -> bool:
+    """Pending transition (enqueue / retry / reconcile) of a shot's video job.
+
+    R2-H1: the shot row is locked and reloaded (lock order: generation ->
+    Video -> Shot, so callers write the job and Video rows first) and the
+    decision is made from the CURRENT video jobs in this transaction, so a
+    concurrent terminal recompute of another video job of the shot either
+    commits first (and is corrected here) or waits and sees this pending
+    job. Returns True when the status changed.
+    """
+    from app.models.generation import Generation
+    from app.models.production import Shot
+    from app.services.generations import lock_row
+    from app.services.job_execution import VIDEO_JOB_TYPES
+
+    shot = lock_row(db, Shot, shot_id)
+    if shot is None or shot.status in keep:
+        return False
+    pending = (
+        db.query(Generation.id)
+        .filter(
+            Generation.shot_id == shot.id,
+            Generation.job_type.in_(VIDEO_JOB_TYPES),
+            Generation.status.in_(("queued", "running")),
+        )
+        .count()
+    )
+    if not pending:
+        return False
+    check_enum("shot_status", "video_generating")
+    shot.status = "video_generating"
+    db.flush()
+    return True
+
+
+def on_video_job_retried(db: Session, gen) -> None:
+    """A re-queued video job: its Video row and the shot are generating again.
+
+    Lock order generation -> Video -> Shot: the job row is already written,
+    the Video row is updated next, the shot is locked last.
+    """
+    video = _video_of(db, gen)
+    if video is not None and video.status != "done":
+        video.status = "generating"
+        video.error_code = None
+        video.error_message = None
+    db.flush()
+    if gen.shot_id is not None:
+        mark_video_shot_pending(db, gen.shot_id)
+    db.flush()

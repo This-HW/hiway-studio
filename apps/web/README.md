@@ -69,3 +69,4 @@ npm run dev
 | `npm run dev`   | 개발 서버 실행        |
 | `npm run build` | 프로덕션 빌드         |
 | `npm run typecheck` | 타입 체크 (`tsc --noEmit`) |
+| `npm run lint` | ESLint (`eslint.config.mjs`, `eslint-config-next`) |

@@ -8,16 +8,28 @@
 
 import { useEffect, useRef, useState } from "react";
 import { API_BASE } from "./api-client";
+import { SSE_EVENT_NAMES } from "./sse-events";
 
 export type SseConnectionState = "connected" | "reconnecting" | "disconnected";
 
 interface UseSseOptions {
   enabled?: boolean;
+  /**
+   * Called when the stream re-opens after a drop. Events published while
+   * disconnected are not replayed (memory/Redis pub-sub backend), so the
+   * caller must refetch what it shows.
+   */
+  onResync?: () => void;
 }
 
 /**
  * Subscribe to the backend SSE stream (GET /api/v1/events).
- * - onEvent receives the parsed `event:` field name and the JSON-parsed `data:` payload.
+ * - The backend sends NAMED events (`event: job.progress` ...). EventSource
+ *   only routes unnamed frames to `onmessage`, so a listener is registered
+ *   for every contract event name (lib/contracts.gen.ts, generated from
+ *   packages/contracts/sse_events.json). Unnamed frames still arrive as
+ *   "message".
+ * - onEvent receives the event name and the JSON-parsed `data:` payload.
  * - Returns the current connection state.
  */
 export function useSse(
@@ -28,6 +40,8 @@ export function useSse(
   const [state, setState] = useState<SseConnectionState>("disconnected");
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const onResyncRef = useRef(options.onResync);
+  onResyncRef.current = options.onResync;
 
   useEffect(() => {
     if (!enabled || typeof window === "undefined") {
@@ -36,6 +50,9 @@ export function useSse(
 
     const source = new EventSource(`${API_BASE}/api/v1/events`);
     setState("reconnecting");
+    // True after an error until the next successful open: that open is a
+    // reconnect, and anything published in between was missed.
+    let dropped = false;
 
     const handleAny = (ev: MessageEvent) => {
       const name = ev.type || "message";
@@ -47,11 +64,19 @@ export function useSse(
       }
       onEventRef.current(name, data);
     };
+    const listener = handleAny as EventListener;
 
-    const handleOpen = () => setState("connected");
+    const handleOpen = () => {
+      setState("connected");
+      if (dropped) {
+        dropped = false;
+        onResyncRef.current?.();
+      }
+    };
     const handleError = () => {
       // EventSource auto-reconnects per the SSE spec; mark as reconnecting
       // while the browser retries. Only drop to disconnected on close().
+      dropped = true;
       if (source.readyState === EventSource.CLOSED) {
         setState("disconnected");
       } else {
@@ -59,14 +84,17 @@ export function useSse(
       }
     };
 
-    // Parse named events from the `event:` field.
-    // Phase 0 knows only the 7 names in lib/sse-events.ts; the hook stays
-    // generic so Phase 1+ can add listeners without touching this file.
+    for (const name of SSE_EVENT_NAMES) {
+      source.addEventListener(name, listener);
+    }
     source.onmessage = handleAny;
     source.onopen = handleOpen;
     source.onerror = handleError;
 
     return () => {
+      for (const name of SSE_EVENT_NAMES) {
+        source.removeEventListener(name, listener);
+      }
       source.onmessage = null;
       source.onopen = null;
       source.onerror = null;

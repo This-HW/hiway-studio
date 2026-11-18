@@ -112,9 +112,9 @@ def test_submit_poll_fetch_success(adapter):
     first = ad.poll(job_id)
     assert first.state == "running"
 
-    out_dir = tmp_path / "generated_images"
-    png = out_dir / "sess1" / "ig_abc123.png"
-    png.parent.mkdir(parents=True)
+    # The CLI writes the per-job output file the instruction names (the
+    # shared generated_images folder is never used, B7-r2 H1).
+    png = ad._jobs[job_id].output_path
     png.write_bytes(b"\x89PNG\r\n\x1a\nfakepng")
 
     final = ad.poll(job_id)

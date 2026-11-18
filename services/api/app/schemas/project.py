@@ -39,6 +39,16 @@ class ProjectRead(BaseModel):
     category_pack_name: str | None = None
     episode_count: int = 0
     scene_count: int = 0
+    # Project-card summary (P0_SCREENS §1), computed by services.project.card_stats.
+    # Representative frame: relative path (GET /files/{path}) of the first
+    # scene's first shot's approved frame, or None.
+    thumbnail: str | None = None
+    shot_count: int = 0
+    approved_shot_count: int = 0
+    clip_count: int = 0
+    # Current UTC month, USD. actual == cost summary total_actual_usd.
+    monthly_cost_estimated_usd: float = 0.0
+    monthly_cost_actual_usd: float = 0.0
     created_at: datetime
     updated_at: datetime
 

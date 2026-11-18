@@ -26,7 +26,7 @@
 | §7 프롬프트 조립 | `app/services/prompt_assembly.py` | 조립 순서 변경 시 MODULES 카드도 갱신 |
 | §8.1 REST 60여 개 | `app/routers/<리소스>.py` | 라우터는 얇게 (검증→서비스 호출→응답) |
 | §8.2 SSE 7종 | `app/core/sse_bridge.py` | 이벤트명은 `packages/contracts`가 정본 |
-| §8.4 오류 16종 | `app/core/errors.py` | 새 오류 추가 시 contracts에 먼저 등록 |
+| §8.4 오류 18종 (`packages/contracts/errors.json`) | `app/core/errors.py` | 새 오류 추가 시 contracts에 먼저 등록 |
 | §9 비용 | `app/services/cost_estimator.py`, `budget_guard.py` | 단가는 DB, 기본값은 `core/defaults.py` |
 | §10 QC | `app/services/qc_orchestrator.py` | 새 검사는 `CHECKS` 레지스트리에 1행 + 임계값은 `core/defaults.py` (개별 파일 `media/qc_checks/`는 두지 않는다 — MODULES.md) |
 | §11 파일 저장 | `app/files/` | 상대경로 강제, 불변 가드 |

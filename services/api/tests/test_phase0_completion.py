@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -115,7 +116,11 @@ def test_stub_text_to_image_end_to_end(phase0_env):
         rel = gen.output_path
     assert rel is not None
     assert not os.path.isabs(rel), f"absolute path stored in DB: {rel}"
-    assert rel == f"projects/{project_id}/frames/{generation_id}_0.png", rel
+    # One immutable file per execution attempt (ADR-0013 B4a-fix):
+    # {generation_id}_{batch_index}_{exec token[:8]}.png
+    assert re.fullmatch(
+        rf"projects/{project_id}/frames/{generation_id}_0_[0-9a-f]{{8}}\.png", rel
+    ), rel
     abs_path = phase0_env / rel
     assert abs_path.is_file() and abs_path.stat().st_size > 0
     assert abs_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"  # real PNG bytes
@@ -163,7 +168,10 @@ def test_events_endpoint_streams_sse(phase0_env):
 
                 def _publish():
                     time.sleep(0.5)  # let the SSE subscription register
-                    get_bridge().publish("job_events", "job.progress", {"job_id": "probe"})
+                    get_bridge().publish("job_events", "job.progress", {
+                        "job_id": "probe", "job_type": "text_to_image", "status": "running",
+                        "progress_pct": 10.0, "stage": "probe",
+                    })
 
                 publisher = threading.Thread(target=_publish, daemon=True)
                 publisher.start()
@@ -176,7 +184,8 @@ def test_events_endpoint_streams_sse(phase0_env):
                 publisher.join(timeout=5)
 
         assert received[0] == "event: job.progress", received
-        assert received[1].startswith('data: {"job_id": "probe"}'), received
+        assert received[1].startswith("data: "), received
+        assert json.loads(received[1][len("data: "):])["job_id"] == "probe", received
     finally:
         server.should_exit = True
         thread.join(timeout=10)

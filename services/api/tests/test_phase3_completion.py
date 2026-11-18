@@ -14,7 +14,7 @@ Proves the Phase-3 acceptance criteria end to end: 5 approved stills ->
      video -> 400),
   6. rendering locks the timeline: PATCH and re-render -> 409 RENDER_LOCKED,
   7. export presets: 4 read-only built-ins; custom CRUD; built-in edit -> 400,
-  8. render -> output.mp4, ffprobe-verified: H.264, 24fps, 1920x1080
+  8. render -> output_<attempt>.mp4, ffprobe-verified: H.264, 24fps, 1920x1080
      (YouTube 16:9 preset), AAC 48kHz, ~9s from 5 stub clips,
   9. T2V needs no frame approval (unapproved shot -> clip generated).
 
@@ -88,6 +88,7 @@ def _ffprobe(path: Path) -> dict:
     return _json.loads(out.stdout)
 
 
+@pytest.mark.needs_ffmpeg
 def test_phase3_completion(api_env):
     client, tmp_path = api_env
 
@@ -288,7 +289,10 @@ def test_phase3_completion(api_env):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "done", body
-    assert body["output_path"].endswith("output.mp4")
+    # Plan D8: each render publishes an immutable per-attempt file.
+    import re
+
+    assert re.search(r"/timelines/[0-9a-f-]+/output_[0-9a-f]{8}\.mp4$", body["output_path"])
     out_path = tmp_path / body["output_path"]
     assert out_path.is_file()
 

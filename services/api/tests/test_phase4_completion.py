@@ -230,6 +230,7 @@ def _setup_project(client, tmp_path, clips) -> dict:
     return {"pid": pid, "sid": sid, "tid": tid, "shot_ids": shot_ids}
 
 
+@pytest.mark.needs_ffmpeg
 def test_phase4_subtitle_qc_render_cost(api_env):
     client, tmp_path = api_env
     clips, bgm, _loud = _make_media(tmp_path)
@@ -465,6 +466,7 @@ def test_phase4_subtitle_qc_render_cost(api_env):
     assert r.status_code == 403 and r.json()["code"] == "BUDGET_EXCEEDED", r.text
 
 
+@pytest.mark.needs_ffmpeg
 def test_phase4_render_gate_matrix(api_env):
     """no_report / stale / fail / warn-without-ignore -> 409 QC_FAILED."""
     client, tmp_path = api_env

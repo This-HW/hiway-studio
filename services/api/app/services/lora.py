@@ -149,15 +149,17 @@ def complete_train(db: Session, lora_model_id: str) -> dict[str, Any]:
              {"status": "training", "progress_pct": 50.0, "stage": "training"})
 
     character = _get_character(db, lora.character_id)
-    rel_path = f"{_character_dir(character)}/lora/{lora.trigger_word}.safetensors"
-    abs_path = paths.ensure_parent(paths.projects_root() / rel_path)
+    # The file name never contains user input (trigger_word is data only) and
+    # the absolute path is containment-checked before anything is written.
+    rel_path = paths.assert_relative(f"{_character_dir(character)}/lora/{lora.id}.safetensors")
+    abs_path = paths.ensure_parent(paths.resolve(rel_path))
     # Stub weight file: a real backend writes the trained .safetensors here.
     immutability.write_new(
         abs_path,
         f"# stub LoRA weights for trigger '{lora.trigger_word}' "
         f"(character {lora.character_id}); replace with a real training backend.\n".encode(),
     )
-    lora.model_path = paths.assert_relative(rel_path)
+    lora.model_path = rel_path
     lora.status = "ready"
     lora.actual_cost_usd = lora.estimated_cost_usd
 

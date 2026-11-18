@@ -1,4 +1,4 @@
-.PHONY: dev migrate seed gen-types test lint-imports demo web-install help
+.PHONY: dev migrate seed gen-types gen-types-check test lint-imports demo web-install verify-cjk help
 
 # Python interpreter: repo-local .venv first, then $PYTHON, then python3.
 PYTHON := $(shell \
@@ -23,9 +23,17 @@ seed: ## 모델·카테고리팩 seed 로드 (멱등)
 gen-types: ## contracts JSON에서 TS 타입 생성
 	$(PYTHON) packages/contracts/tools/gen_types.py
 
-test: ## API pytest + web typecheck
-	docker compose run --rm api pytest -q
+gen-types-check: ## 생성된 apps/web/lib/contracts.gen.ts가 contracts JSON과 일치하는지 검사
+	$(PYTHON) packages/contracts/tools/gen_types.py --check
+
+# Tests never touch the service DB from .env (R2-C1): DATABASE_URL is replaced
+# by SQLite and the Postgres opt-in (TEST_DATABASE_URL, a *_test DB) is cleared.
+test: ## API pytest (strict: ffmpeg/CJK font required in the image) + web typecheck
+	docker compose run --rm -e REQUIRE_MEDIA_TOOLS=1 -e DATABASE_URL=sqlite:///:memory: -e TEST_DATABASE_URL= api pytest -q
 	cd apps/web && npm run typecheck
+
+verify-cjk: ## 한글 burn-in 자막이 글리프로 렌더되는지 이미지 안에서 검증 (OCR)
+	docker compose run --rm api python /repo/tools/verify_cjk_burnin.py
 
 lint-imports: ## 모듈 의존성 방향 검사
 	$(PYTHON) tools/lint_imports.py

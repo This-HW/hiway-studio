@@ -1,6 +1,7 @@
 """Engine and session factory. DSN comes from settings only (no hardcoded URL)."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
@@ -9,6 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.base import Base  # noqa: F401  (re-exported for alembic env)
+
+_log = logging.getLogger("ai_studio.db.session")
 
 _engine = None
 _SessionLocal: sessionmaker | None = None
@@ -76,8 +79,14 @@ def dispatch_after_commit(db: Session, fn: Callable[[], None]) -> None:
 
 
 def _run_pending(session: Session) -> None:
+    # Every callback is attempted even if an earlier one raises (e.g. broker
+    # down for one send): the rows are already committed, so a lost dispatch
+    # is recovered by the reconcile loop (ADR-0013), never by skipping the rest.
     for fn in _PENDING_DISPATCH.pop(id(session), []):
-        fn()
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - logged; reconcile re-dispatches
+            _log.exception("after-commit dispatch callback failed; reconcile will recover it")
 
 
 def _drop_pending(session: Session) -> None:

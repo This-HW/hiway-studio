@@ -4,9 +4,14 @@ Owns render jobs: run_render(timeline_id) — single argument. The DB row is
 the source of truth (ARCHITECTURE §8); the heavy lifting lives in
 services/render.py so the task stays a thin wrapper (tasks -> services OK).
 
-Retry policy: render failures are deterministic (bad input / ffmpeg errors),
-so they fail fast without burning retries. A render can always be requested
-again after fixing the timeline.
+Retry policy: render failures are deterministic (bad input / ffmpeg errors /
+postflight), so they fail fast without burning retries. A render can always
+be requested again after fixing the timeline.
+
+Render execution ownership (ADR-0013, plan D8): request_render claimed the
+timeline with an exec_token; services/render.render_timeline marks the start
+(a duplicate delivery is a no-op), commits `failed` itself on any error
+(token-guarded) and publishes only through a token-guarded UPDATE.
 """
 from __future__ import annotations
 
@@ -30,13 +35,15 @@ def render_timeline(self: Task, timeline_id: str) -> dict:
         log.info("render succeeded timeline_id=%s", timeline_id)
         return summary
     except StudioError:
-        # render_timeline already marked the timeline failed and published
-        # render.completed{status: failed}; just re-raise for Celery bookkeeping.
+        # render_timeline already COMMITTED the timeline as failed (token-
+        # guarded) and published render.completed{failed}; re-raise for Celery.
         log.warning("render failed timeline_id=%s", timeline_id)
         raise
     except Exception:
-        # Unexpected (non-StudioError) failures must not leave the timeline
-        # stuck in "rendering": mark it failed here so the UI unlocks.
+        # render_timeline commits `failed` for crashes inside its execution
+        # too. This net only covers a crash before the execution existed, and
+        # only for legacy rows without an exec_token (reconcile handles the
+        # rest by lease), so it can never overwrite a newer render.
         log.exception("render crashed timeline_id=%s", timeline_id)
         render_service.fail_timeline_unexpected(timeline_id)
         raise
@@ -49,8 +56,13 @@ register_job_dispatcher("q.post.render_timeline", render_timeline.delay)
 
 @celery_app.task(name="q.post.run_qc", bind=True, max_retries=defaults.RETRY_MAX_ATTEMPTS)
 def run_qc(self: Task, qc_report_id: str) -> dict:
-    """Run the 13-check QC gate for one report. Single task arg: the row is
-    the source of truth (created by request_qc with overall='pending')."""
+    """Run the 15-check QC gate for one report. Single task arg: the row is
+    the source of truth (created by request_qc with overall='pending').
+
+    On a crash outside the per-check isolation, qc_orchestrator.run_qc has
+    already committed the report as overall='fail' (+ error_message) and
+    published qc.completed before re-raising; here we only log for Celery
+    bookkeeping (no retry — QC failures are deterministic)."""
     from app.services import qc_orchestrator
 
     try:
@@ -58,7 +70,7 @@ def run_qc(self: Task, qc_report_id: str) -> dict:
         log.info("qc succeeded qc_report_id=%s", qc_report_id)
         return summary
     except Exception:
-        log.exception("qc crashed qc_report_id=%s", qc_report_id)
+        log.exception("qc crashed qc_report_id=%s (report marked fail)", qc_report_id)
         raise
 
 

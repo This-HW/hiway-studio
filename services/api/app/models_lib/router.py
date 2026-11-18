@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.core.errors import ErrorCode, StudioError
-from app.models_lib import registry
+from app.models_lib import capabilities, registry
 
 
 def route(
@@ -26,22 +26,29 @@ def route(
         model = registry.get_model(explicit_model_id, db)
         if model.get("status") == "disabled":
             raise StudioError(ErrorCode.MODEL_UNAVAILABLE, f"Model is disabled: {explicit_model_id}.")
-        declared = (model.get("capabilities") or {}).get("tasks")
-        if declared and task not in declared:
+        if not capabilities.supports_task(model, task):
+            # A client choice, not an outage: 4xx, never retried (ADR-0014).
             raise StudioError(
-                ErrorCode.MODEL_UNAVAILABLE,
+                ErrorCode.VALIDATION_ERROR,
                 f"Model {explicit_model_id} does not support task: {task}.",
-                details={"reason": "task_unsupported", "task": task},
+                details={
+                    "reason": "task_unsupported",
+                    "task": task,
+                    "supported_tasks": capabilities.declared_tasks(model) or [],
+                },
             )
         return {"model_id": model["model_id"], "adapter": model["provider_id"], "reason": "explicit"}
 
     if project_default_model_id:
         model = registry.get_model(project_default_model_id, db)
-        return {
-            "model_id": model["model_id"],
-            "adapter": model["provider_id"],
-            "reason": "project_default",
-        }
+        # A project default that cannot do this task (e.g. a t2i default for
+        # an inpaint request) falls through to the router rule (ADR-0014).
+        if capabilities.supports_task(model, task):
+            return {
+                "model_id": model["model_id"],
+                "adapter": model["provider_id"],
+                "reason": "project_default",
+            }
 
     candidates = registry.list_by_modality(modality, db)
     if not candidates:
@@ -49,14 +56,12 @@ def route(
 
     # Task filter: models that declare capabilities.tasks only serve those
     # tasks (e.g. stub.i2v-* vs stub.t2v-*). Models without the declaration
-    # (image seeds) keep the old behavior and serve every task.
-    task_aware = [
-        m for m in candidates
-        if task in ((m.get("capabilities") or {}).get("tasks") or [task])
-    ]
+    # serve every task except editing ones (inpaint/outpaint/upscale/i2i
+    # need an explicit declaration, ADR-0014).
+    task_aware = [m for m in candidates if capabilities.supports_task(m, task)]
     if task_aware:
         candidates = task_aware
-    elif any((m.get("capabilities") or {}).get("tasks") for m in candidates):
+    else:
         raise StudioError(
             ErrorCode.MODEL_UNAVAILABLE,
             f"No active model supports task: {task}.",

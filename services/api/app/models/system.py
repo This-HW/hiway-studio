@@ -4,6 +4,9 @@ Phase-1 additions: llm_calls (text-LLM call history, G-12).
 model_providers / model_pricing / prompt_snippets arrive in Phase 4 with
 cost tracking. Pricing stays flattened on models until then.
 export_presets arrived in Phase 3 (P0-18, ADR-0004).
+B5 (plan D1/D2/D7, Alembic 0016): llm_calls.status (budget reservation),
+idempotency_records (DB idempotency keys), budget_holds (carry-over
+reservation of an uncertain attempt that a manual retry re-queued).
 """
 from __future__ import annotations
 
@@ -11,7 +14,10 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON, Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text,
+    UniqueConstraint, func,
+)
 from sqlalchemy import Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -62,6 +68,69 @@ class LLMCall(Base):
     input_text: Mapped[str] = mapped_column(Text, nullable=False)
     output_text: Mapped[str] = mapped_column(Text, nullable=False)
     estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
+    # Budget reservation state (plan D1, budget_guard.LLM_*): 'pending' is
+    # committed BEFORE the external call (reserved), then 'succeeded'
+    # (spent), 'failed' (nothing was sent / provider refused: released) or
+    # 'uncertain' (sent, outcome unknown: stays reserved). NULL = legacy row
+    # written after a completed call (counted as spent).
+    status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class IdempotencyRecord(Base):
+    """One accepted job-creating request per Idempotency-Key (plan D2).
+
+    Unique per (method, ACTUAL request path, key): the same key on two
+    different shots is two records. Written in the same transaction as the
+    job rows/reservations it answers for, so a replay never sees a response
+    whose jobs did not commit. Only 2xx responses are recorded.
+    """
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        UniqueConstraint("method", "path", "key", name="uq_idempotency_records_method_path_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    method: Mapped[str] = mapped_column(String(8), nullable=False)
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class BudgetHold(Base):
+    """Carry-over budget reservation (plan D1/D7, RH1).
+
+    A manual retry of a PROVIDER_UNCERTAIN job puts the row back to queued
+    (its new attempt is reserved through the row). The old attempt may still
+    be charged, so its estimate stays reserved here. Never released
+    automatically (no provider settlement yet).
+    """
+
+    __tablename__ = "budget_holds"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # generation|audio
+    source_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    amount_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False, default="provider_uncertain")
+    # Budget period of the HELD (old) attempt: its reserved_at, not the time
+    # of the retry that created the hold (B5 review H1).
+    period_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

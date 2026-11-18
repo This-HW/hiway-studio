@@ -7,14 +7,14 @@ as task arguments (ARCHITECTURE §8).
 Pipeline: route -> submit -> poll -> fetch_result -> save mp4 -> probe ->
 update video row -> update shot status -> SSE events.
 
-Retry policy (§12.2): same as the image worker — retryable failures are
-retried up to defaults.RETRY_MAX_ATTEMPTS with exponential backoff; every
-execution is recorded as a GenerationAttempt row.
+Retry policy (§12.2): same as the image worker — retryable failures before
+the provider submit intent are retried up to defaults.RETRY_MAX_ATTEMPTS with
+exponential backoff; every execution is recorded as a GenerationAttempt row.
+Ownership / D7 rules: services/job_execution.py (ADR-0013).
 """
 from __future__ import annotations
 
 import logging
-import random
 import uuid
 from datetime import datetime, timezone
 
@@ -27,15 +27,11 @@ from app.core.sse_bridge import CHANNEL, get_bridge
 from app.db.session import session_scope
 from app.files import immutability, paths
 from app.media import ffmpeg_ops
-from app.models.generation import Generation, GenerationAttempt
-from app.models_lib import registry, router
-from app.models_lib.adapters.http_polling import poll_until_done
-from app.models_lib.base import JobStatus
+from app.models.generation import Generation
+from app.models_lib import media_check, registry, router
+from app.services import job_execution
 
 log = logging.getLogger("ai_studio.tasks.video")
-
-TERMINAL = ("succeeded", "failed", "canceled")
-
 
 def _now():
     return datetime.now(timezone.utc)
@@ -60,27 +56,36 @@ def _adapter_payload(db, gen: Generation) -> dict:
     if gen.job_type == "image_to_video":
         inputs = [p for p in (gen.input_paths or [])]
         payload["images"] = [_abs(p) for p in inputs if p]
+        if payload["images"]:
+            # Provider input contract key (ADR-0014): the start frame.
+            payload["init_image"] = payload["images"][0]
     return payload
 
 
-def _progress(db, gen: Generation, generation_id: str, job_type: str, pct: float, stage: str) -> None:
-    gen.progress_pct = pct
-    db.flush()
+def _progress(ex, generation_id: str, job_type: str, pct: float, stage: str) -> None:
+    """Guarded progress write (also a heartbeat + cancel check), then SSE."""
+    job_execution.require(ex, {"progress_pct": pct})
     get_bridge().publish(
         CHANNEL,
         "job.progress",
         {
             "job_id": generation_id,
             "job_type": job_type,
-            "status": gen.status,
+            "status": "running",
             "progress_pct": pct,
             "stage": stage,
         },
     )
 
 
-def _save_clip(db, gen: Generation, video, data: bytes) -> str:
-    """Save the clip mp4 + a thumbnail still. Returns the relative path."""
+def _save_clip(db, gen: Generation, video, data: bytes, tag: str) -> dict:
+    """Write this attempt's clip mp4 + thumbnail still; no DB writes.
+
+    `{video_id}_{tag}.mp4` (tag = exec token prefix): the same Video row is
+    reused by a manual retry, so a lost/failed attempt's file must never sit
+    on the next attempt's path (ADR-0013 B4a-fix). Returns the relative
+    paths and probed media facts; the token-guarded UPDATE publishes them.
+    """
     from app.models.production import Scene, Shot
 
     shot = db.get(Shot, gen.shot_id)
@@ -89,215 +94,214 @@ def _save_clip(db, gen: Generation, video, data: bytes) -> str:
     scene = db.get(Scene, shot.scene_id)
     scene_id = scene.id if scene is not None else shot.scene_id
     rel_dir = f"projects/{gen.project_id}/scenes/{scene_id}/shots/{shot.id}/videos"
-    filename = f"{video.id}.mp4"
+    filename = f"{video.id}_{tag}.mp4"
     abs_path = paths.ensure_parent(paths.projects_root() / rel_dir / filename)
     immutability.write_new(abs_path, data)
     rel_path = paths.assert_relative(f"{rel_dir}/{filename}")
+    thumb_rel = None
     try:
-        thumb_abs = abs_path.with_name(f"{video.id}.thumb.jpg")
+        thumb_abs = abs_path.with_name(f"{video.id}_{tag}.thumb.jpg")
         ffmpeg_ops.extract_frame(abs_path, thumb_abs, at_sec=0.5)
-        gen.output_thumbnail_path = paths.assert_relative(paths.to_relative(thumb_abs))
+        thumb_rel = paths.assert_relative(paths.to_relative(thumb_abs))
     except StudioError:
         log.warning("thumbnail skipped for %s", rel_path)
-    return rel_path
+    facts = _validated_facts(abs_path, data, rel_path)
+    return {"output_path": rel_path, "thumbnail_path": thumb_rel, "facts": facts}
 
 
-def _update_shot_status(db, gen: Generation) -> None:
-    """Recompute the shot status once no video job is pending.
+def _validated_facts(abs_path, data: bytes, rel_path: str) -> dict:
+    """Probe the downloaded clip; a clip that cannot be probed FAILS the job
+    (audit F16: never substitute the requested values for a broken file).
 
-    A finished clip never demotes the shot below what the approved frame
-    already earned: failure without any done clip falls back to
-    frame_approved (the frame is still usable for a retry).
+    Only a missing ffprobe binary (an environment gap, not a property of the
+    file) degrades to the magic-byte check with the requested values.
     """
-    from app.core.contracts import check_enum
-    from app.models.production import Shot
-    from app.models.generation import Generation, Video
-
-    if gen.shot_id is None:
-        return
-    shot = db.get(Shot, gen.shot_id)
-    if shot is None:
-        return
-    pending = (
-        db.query(Generation)
-        .filter(
-            Generation.shot_id == shot.id,
-            Generation.job_type.in_(("image_to_video", "text_to_video")),
-            Generation.status.in_(("queued", "running")),
+    try:
+        facts = ffmpeg_ops.probe(abs_path)
+    except StudioError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            media_check.check_media(data, "video", what=f"Downloaded clip {rel_path}")
+            log.warning("ffprobe unavailable; %s checked by magic bytes only", rel_path)
+            return {}
+        raise StudioError(
+            ErrorCode.PROVIDER_ERROR,
+            f"Downloaded clip failed validation (ffprobe): {exc.message}",
+            details={"reason": "result_probe_failed", "path": rel_path},
+        ) from exc
+    if not facts.get("duration_sec"):
+        raise StudioError(
+            ErrorCode.PROVIDER_ERROR,
+            "Downloaded clip has no duration (not a playable video).",
+            details={"reason": "result_probe_failed", "path": rel_path},
         )
-        .count()
-    )
-    if pending:
-        return
-    done_clips = (
-        db.query(Video)
-        .filter(Video.shot_id == shot.id, Video.status == "done")
-        .count()
-    )
-    if done_clips:
-        next_status = "video_done"
-    elif shot.approved_frame_generation_id:
-        next_status = "frame_approved"
-    else:
-        next_status = "failed"
-    if shot.status != next_status:
-        check_enum("shot_status", next_status)
-        shot.status = next_status
-    db.flush()
+    return facts
 
 
 @celery_app.task(name="q.video.run_generation", bind=True, max_retries=defaults.RETRY_MAX_ATTEMPTS)
 def run_generation(self: Task, generation_id: str) -> dict:
-    """Run one video generation end to end. Returns a summary dict."""
-    with session_scope() as db:
-        from app.models.generation import Generation, Video
+    """Run one video generation end to end. Returns a summary dict.
 
-        gen = db.get(Generation, uuid.UUID(generation_id))
-        if gen is None:
+    Same execution-ownership contract as the image worker (ADR-0013): claim
+    or no-op, token-guarded writes, D7 submit intent, failure committed
+    before SSE/raise.
+    """
+    from app.models.generation import Video
+
+    gid = uuid.UUID(generation_id)
+    ex = job_execution.claim(Generation, gid)
+    if ex is None:
+        status = job_execution.current_status(Generation, gid)
+        if status is None:
             raise StudioError(ErrorCode.NOT_FOUND, "Generation not found.", details={"job_id": generation_id})
+        log.info("video generation not claimable (status=%s), no-op job_id=%s", status, generation_id)
+        return {"generation_id": generation_id, "status": status}
 
-        if gen.status == "canceled":
-            log.info("generation canceled before run job_id=%s", generation_id)
-            return {"generation_id": generation_id, "status": "canceled"}
-
-        job_type = gen.job_type or "image_to_video"
-        video = (
-            db.query(Video).filter(Video.generation_id == gen.id).order_by(Video.created_at.desc()).first()
-        )
-        attempt = GenerationAttempt(
-            generation_id=gen.id,
-            attempt_no=gen.retry_count + 1,
-            model_id=gen.model_id or "",
-            started_at=_now(),
-        )
-        db.add(attempt)
-        gen.status = "running"
-        gen.started_at = gen.started_at or _now()
-        db.flush()
-
-        try:
-            _progress(db, gen, generation_id, job_type, 5.0, "routing")
-            routed = router.route(
-                task=job_type,
-                modality="video",
-                explicit_model_id=gen.model_id,
-                db=db,
-            )
-            adapter = registry.get_adapter(routed["adapter"])
-            attempt.model_id = routed["model_id"]
-
-            _progress(db, gen, generation_id, job_type, 20.0, "submitted")
-            provider_job_id = adapter.submit(routed["model_id"], _adapter_payload(db, gen))
-            attempt.provider_job_id = provider_job_id
-
-            def _on_poll(status: JobStatus) -> None:
-                _progress(
-                    db, gen, generation_id, job_type,
-                    20.0 + status.progress_pct * 0.5, status.stage or "polling",
-                )
-
-            final = poll_until_done(adapter, provider_job_id, on_progress=_on_poll)
-            if final.state != "succeeded":
-                raise StudioError(
-                    final.error_code or ErrorCode.PROVIDER_ERROR,
-                    final.error_message or "Provider reported failure.",
-                )
-
-            _progress(db, gen, generation_id, job_type, 90.0, "saving")
-            data = adapter.fetch_result(provider_job_id)
-            if video is None:
-                raise StudioError(ErrorCode.NOT_FOUND, "Video row not found for generation.")
-            rel_path = _save_clip(db, gen, video, data)
-
-            # Probe the actual media facts; fall back to requested values.
+    with session_scope() as db:
+        job_type = db.get(Generation, gid).job_type or "image_to_video"
+    phase = job_execution.PHASE_PRE
+    try:
+        with job_execution.keepalive(ex):
             try:
-                facts = ffmpeg_ops.probe(paths.projects_root() / rel_path)
-            except StudioError:
-                facts = {}
-                log.warning("probe failed for %s; using requested values", rel_path)
-            video.output_path = rel_path
-            video.duration_sec = facts.get("duration_sec") or video.duration_sec
-            video.fps = int(facts.get("fps") or video.fps)
-            if facts.get("width"):
-                video.resolution = f"{facts['width']}x{facts['height']}"
-            video.model_id = routed["model_id"]
-            video.status = "done"
-            video.error_code = None
-            video.error_message = None
+                _progress(ex, generation_id, job_type, 5.0, "routing")
+                with session_scope() as db:
+                    gen = db.get(Generation, gid)
+                    routed = router.route(
+                        task=job_type,
+                        modality="video",
+                        explicit_model_id=gen.model_id,
+                        db=db,
+                    )
+                    payload = _adapter_payload(db, gen)
+                    # The adapter runs the config the pre-check saw (DB
+                    # overlay), not the seed cache (B7-r2 M4).
+                    model = registry.get_model(routed["model_id"], db)
+                    has_video = (
+                        db.query(Video).filter(Video.generation_id == gid).first() is not None
+                    )
+                if not has_video:
+                    raise StudioError(ErrorCode.NOT_FOUND, "Video row not found for generation.")
+                adapter = registry.get_adapter(routed["adapter"])
+                ex.model_id = routed["model_id"]
 
-            gen.status = "succeeded"
-            gen.progress_pct = 100.0
-            gen.output_path = rel_path
-            gen.model_id = routed["model_id"]
-            gen.actual_cost_usd = gen.estimated_cost_usd
-            gen.finished_at = _now()
-            gen.error_code = None
-            gen.error_message = None
-            attempt.finished_at = _now()
-            db.flush()
+                phase = job_execution.PHASE_SUBMITTING
+                with registry.pinned_model(model):
+                    data = job_execution.submit_poll_fetch(
+                        ex, adapter, routed["model_id"], payload,
+                        progress=lambda pct, stage: _progress(ex, generation_id, job_type, pct, stage),
+                    )
+                phase = job_execution.PHASE_LOCAL
+                # Per-attempt immutable clip first, outside any write
+                # transaction (D8 pattern); the guarded UPDATE publishes it.
+                job_execution.require(ex, {})
+                with session_scope() as db:
+                    gen = db.get(Generation, gid)
+                    video = (
+                        db.query(Video).filter(Video.generation_id == gid)
+                        .order_by(Video.created_at.desc()).first()
+                    )
+                    if video is None:
+                        raise StudioError(ErrorCode.NOT_FOUND, "Video row not found for generation.")
+                    video_id = video.id
+                    saved = _save_clip(db, gen, video, data, ex.token.hex[:8])
+                result: dict = {}
 
-            _update_shot_status(db, gen)
+                def _publish_success(db, gen: Generation) -> None:
+                    # Same transaction as the guarded success UPDATE (owner
+                    # only): the Video row, shot status and paths.
+                    video = db.get(Video, video_id)
+                    if video is None:
+                        raise StudioError(ErrorCode.NOT_FOUND, "Video row not found for generation.")
+                    facts = saved["facts"]
+                    rel_path = saved["output_path"]
+                    video.output_path = rel_path
+                    video.duration_sec = facts.get("duration_sec") or video.duration_sec
+                    video.fps = int(facts.get("fps") or video.fps)
+                    if facts.get("width"):
+                        video.resolution = f"{facts['width']}x{facts['height']}"
+                    video.model_id = routed["model_id"]
+                    video.status = "done"
+                    video.error_code = None
+                    video.error_message = None
+                    gen.output_path = rel_path
+                    if saved["thumbnail_path"]:
+                        gen.output_thumbnail_path = saved["thumbnail_path"]
+                    job_execution.finish_attempt(db, ex)
+                    db.flush()
+                    job_execution.on_generation_terminal(db, gen, success=True)
+                    result["output_path"] = rel_path
 
-            get_bridge().publish(
-                CHANNEL,
-                "job.completed",
-                {
-                    "job_id": generation_id,
-                    "job_type": job_type,
-                    "status": "succeeded",
-                    "output_path": rel_path,
-                    "output_count": 1,
-                },
-            )
-            log.info("video generation succeeded job_id=%s model=%s", generation_id, routed["model_id"])
-            return {"generation_id": generation_id, "status": "succeeded", "output_path": rel_path}
-
-        except StudioError as exc:
-            attempt.finished_at = _now()
-            attempt.error_code = exc.code
-            attempt.error_message = exc.message
-            if exc.retryable and gen.retry_count < defaults.RETRY_MAX_ATTEMPTS:
-                gen.retry_count += 1
-                gen.status = "queued"
-                gen.error_code = exc.code
-                gen.error_message = exc.message
-                db.flush()
-                countdown = (
-                    defaults.RETRY_BACKOFF_BASE_SEC * (2 ** (gen.retry_count - 1))
-                    + random.uniform(0, defaults.RETRY_JITTER_SEC)
+                done = job_execution.guarded_update(
+                    ex,
+                    {
+                        "status": "succeeded",
+                        "progress_pct": 100.0,
+                        "model_id": routed["model_id"],
+                        "actual_cost_usd": Generation.estimated_cost_usd,
+                        "finished_at": _now(),
+                        "error_code": None,
+                        "error_message": None,
+                    },
+                    after=_publish_success,
                 )
-                log.warning(
-                    "video generation failed, retrying job_id=%s attempt=%s code=%s",
-                    generation_id, gen.retry_count, exc.code,
-                )
-                raise self.retry(exc=exc, countdown=countdown)
-            gen.status = "failed"
-            gen.finished_at = _now()
-            gen.error_code = exc.code
-            gen.error_message = exc.message
-            if video is not None:
-                video.status = "failed"
-                video.error_code = exc.code
-                video.error_message = exc.message
-            db.flush()
+                if not done:
+                    raise job_execution.OwnershipLost(generation_id)
+            except (job_execution.OwnershipLost, job_execution.JobFailure):
+                raise
+            except Exception as exc:  # noqa: BLE001 - persisted as a failure below
+                raise job_execution.JobFailure(phase, job_execution.as_studio_error(exc)) from exc
+    except job_execution.OwnershipLost:
+        log.info("video generation lost ownership (canceled/superseded) job_id=%s", generation_id)
+        return {"generation_id": generation_id, "status": "lost"}
+    except job_execution.JobFailure as failure:
+        return _handle_failure(self, ex, failure, generation_id, job_type)
 
-            _update_shot_status(db, gen)
+    get_bridge().publish(
+        CHANNEL,
+        "job.completed",
+        {
+            "job_id": generation_id,
+            "job_type": job_type,
+            "status": "succeeded",
+            "output_path": result["output_path"],
+            "output_count": 1,
+        },
+    )
+    log.info("video generation succeeded job_id=%s model=%s", generation_id, routed["model_id"])
+    return {"generation_id": generation_id, "status": "succeeded", "output_path": result["output_path"]}
 
-            get_bridge().publish(
-                CHANNEL,
-                "job.failed",
-                {
-                    "job_id": generation_id,
-                    "job_type": job_type,
-                    "error_code": exc.code,
-                    "error_message": exc.message,
-                    "retryable": exc.retryable,
-                    "retry_count": gen.retry_count,
-                    "max_retries": defaults.RETRY_MAX_ATTEMPTS,
-                },
-            )
-            log.warning("video generation failed job_id=%s code=%s", generation_id, exc.code)
-            raise
+
+def _handle_failure(self: Task, ex, failure, generation_id: str, job_type: str) -> dict:
+    """Commit the failure (Video failed, shot recomputed) first, then SSE / retry / raise."""
+
+    def _after_fail(db, gen: Generation, code: str, message: str) -> None:
+        job_execution.on_generation_terminal(db, gen, success=False)
+
+    outcome, code = job_execution.record_failure(ex, failure, after_fail=_after_fail)
+    exc = failure.error
+    if outcome == "lost":
+        log.info("video failure not recorded (ownership lost) job_id=%s", generation_id)
+        return {"generation_id": generation_id, "status": "lost"}
+    if outcome == "retry":
+        log.warning(
+            "video generation failed, retrying job_id=%s attempt=%s code=%s",
+            generation_id, ex.retry_count + 1, code,
+        )
+        raise self.retry(exc=exc, countdown=job_execution.retry_countdown(ex.retry_count + 1))
+    get_bridge().publish(
+        CHANNEL,
+        "job.failed",
+        {
+            "job_id": generation_id,
+            "job_type": job_type,
+            "error_code": code,
+            "error_message": exc.message,
+            "retryable": False,
+            "retry_count": ex.retry_count,
+            "max_retries": defaults.RETRY_MAX_ATTEMPTS,
+        },
+    )
+    log.warning("video generation failed job_id=%s code=%s", generation_id, code)
+    raise exc
 
 
 # Register the eager-capable dispatcher so services can enqueue without

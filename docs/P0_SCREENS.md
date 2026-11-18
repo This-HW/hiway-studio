@@ -23,7 +23,8 @@
 
 - 헤더 우측 잡 뱃지: `GET /jobs?status=queued`로 초기 개수를 받고, 이후 SSE `job.progress`로 증감한다.
   클릭 시 드롭다운: 진행 중 잡 목록 (`job_type`, `progress_pct`, `stage`, `eta_sec?`).
-  각 행 클릭 → 해당 잡이 속한 화면으로 이동. 행 내 취소 버튼 → `DELETE /jobs/{id}`.
+  각 행 클릭 → 해당 잡이 속한 화면으로 이동. 행 내 취소 버튼 → `POST /jobs/{id}/cancel` (대기·실행 중 잡만, 아니면 400 `VALIDATION_ERROR`).
+  취소는 낙관적으로 표시하지 않는다: `job.canceled` 이벤트(놓치면 잡 재조회·재연결 보정)로 확정된다.
 - SSE 연결 상태: 헤더에 상태 점 표시 (녹색=연결됨, 황색=재연결 중, 적색=끊김).
   재연결 시 `Last-Event-ID`로 이어받고, 끊겼던 동안의 상태는 `GET /jobs`로 보정한다.
 - SSE 구독은 `lib/sse.ts` 단일 훅만 사용한다. 화면마다 EventSource를 생성하지 않는다.
@@ -35,7 +36,7 @@
 - 모든 생성 버튼 옆에 예상 비용을 표시한다. 생성 API의 `202` 응답에 `estimated_cost_usd`가 포함되므로,
   버튼 클릭 전에 미리보기(모델·배치 수 기준 추정치)를 보여주고, 응답 값으로 확정 표시한다.
 - 프로젝트 예산(`monthly_budget_usd`): 설정 탭과 비용 화면에 진행률 바로 표시.
-  80% 도달 시 황색 + SSE `cost.alert(level='warn')` 토스트. 100% 초과 시 적색 + 모든 신규 생성 버튼 비활성화
+  80% 도달 시 황색 + SSE `cost.alert` 토스트(payload: `project_id, usage_pct, spent_usd, budget_usd, threshold_pct` — `packages/contracts/sse_events.json`). 100% 초과 시 적색 + 모든 신규 생성 버튼 비활성화
   (서버도 `403 BUDGET_EXCEEDED`로 차단한다).
 - 추정치와 실제치 차이가 20%를 초과하면 해당 잡 상세에 차이 배지를 표시한다 (§9.2).
 
@@ -51,7 +52,7 @@
 | `429 QUEUE_FULL` | `retry_after_sec` 카운트다운 표시 후 재시도 버튼 활성화. |
 | 잡 실패 (`job.failed`) | `error_code` 한글 메시지 + `retryable=true`면 "재시도" 버튼 (`POST /jobs/{id}/retry`). 폴백 체인이 있으면 시도 내역을 함께 보여준다. |
 | 삭제 (프로젝트·씬·샷·캐릭터·에셋) | 확인 모달. 프로젝트 삭제는 `?confirm=true` + 제목 직접 입력 확인 (디렉토리 영구 삭제이므로). |
-| 생성 버튼 | 요청 중 비활성화 + `Idempotency-Key` 헤더 전송 (더블클릭 중복 방지). 60초 윈도우. |
+| 생성 버튼 | 요청 중 비활성화 + `Idempotency-Key` 헤더 전송 (더블클릭 중복 방지). 서버 DB(`idempotency_records`)에 `IDEMPOTENCY_TTL_SEC`(24시간) 동안 보관 — 같은 키·같은 본문은 원 응답 재생, 다른 본문은 409 `IDEMPOTENCY_CONFLICT`. |
 
 ### 0.5 자막·QC·비용 일관 규칙
 
@@ -134,7 +135,7 @@
 
 **상태 처리**
 - 빈 상태: 로그라인 입력 유도 ("로그라인 한 줄이면 시작할 수 있습니다").
-- 로딩: LLM 생성 중에는 에디터에 "생성 중…" 플레이스홀더 + 잡 뱃지. 취소 가능 (`DELETE /jobs/{id}`).
+- 로딩: LLM 생성 중에는 에디터에 "생성 중…" 플레이스홀더 + 잡 뱃지. 취소 가능 (`POST /jobs/{id}/cancel`).
 - 에러: `422 MODERATION_BLOCKED` 시 "제공자 정책으로 차단됨" 안내 + 프롬프트 수정 유도.
 
 **API·SSE 매핑**
@@ -328,7 +329,7 @@
 |---|---|
 | 씬·샷 CRUD | `GET/POST /projects/{id}/scenes`, `GET/PATCH/DELETE /scenes/{id}`, `GET/POST /scenes/{id}/shots`, `GET/PATCH/DELETE /shots/{id}` |
 | 순서·복제 | `POST /shots/reorder`, `POST /shots/{id}/duplicate` |
-| 레퍼런스 | `GET/POST /shots/{id}/references` |
+| 레퍼런스 | `GET/POST /shots/{id}/references`, `DELETE /shots/{id}/references/{ref_id}` (ADR-0012) |
 | 비용 추정 | `POST /costs/estimate` |
 | 진행률 | `job.progress`, `job.completed`, `job.failed` |
 
@@ -390,7 +391,7 @@
 | 영역 수정 | `POST /shots/{id}/inpaint` |
 | 승인 | `POST /shots/{id}/frame/approve` |
 | 영상화 | `POST /shots/{id}/video` |
-| 잡 조회·재시도·취소 | `GET /jobs/{id}`, `POST /jobs/{id}/retry`, `DELETE /jobs/{id}` |
+| 잡 조회·재시도·취소 | `GET /jobs/{id}`, `POST /jobs/{id}/retry` (202), `POST /jobs/{id}/cancel` (200) |
 | 모델 목록 | `GET /models?modality=image`, `GET /models?modality=video` |
 | 진행률 | `job.progress`, `job.completed`, `job.failed`, `job.canceled` |
 
@@ -482,7 +483,7 @@
 - 출력:
   - 프리셋 선택: YouTube 16:9 / Shorts 9:16 / Reels / TikTok / 커스텀 (목록 조회는 ADR-0004).
   - 렌더 버튼: 유효한 리포트(`overall != 'fail'`)가 있을 때만 활성화.
-    `POST /timelines/{id}/render {export_preset_id, ignore_warnings?}` → SSE `render.completed` → `output.mp4` 다운로드+플레이어.
+    `POST /timelines/{id}/render {export_preset_id, ignore_warnings?}` → SSE `render.completed` → `GET /timelines/{id}/output`(타임라인 `output_path`가 가리키는 시도별 파일 `output_<token8>.mp4`) 다운로드+플레이어.
 - 비용 대시보드:
   - `GET /projects/{project_id}/costs/summary?group_by=month|project|model` 집계 테이블.
   - 예산 바: 당월 `actual_cost_usd` / `monthly_budget_usd` (80% 황색, 100% 적색).

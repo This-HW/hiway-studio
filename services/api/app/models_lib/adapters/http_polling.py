@@ -29,10 +29,13 @@ Seed config schema (model seed JSON, ``capabilities.http``)::
                                       # submit-payload param holding a LOCAL
                                       # file path. Exactly-one-placeholder +
                                       # missing/empty value -> step SKIPPED.
-          "extra_fields": {"overwrite": "true", "type": "input"},
+          "extra_fields": {"overwrite": "false", "type": "input"},
                                       # optional extra form fields, {..}-rendered
           "filename_response_path": "name",
                                       # JSON path of the stored filename
+          "subfolder_response_path": "subfolder",
+                                      # optional; non-empty value is joined
+                                      # as "<subfolder>/<name>"
           "store_as": "uploaded_image",
                                       # ctx key; use {uploaded_image} in the
                                       # submit body_template below
@@ -58,8 +61,12 @@ Seed config schema (model seed JSON, ``capabilities.http``)::
           "headers": {},              # optional; same env: rules as submit
           "state_path": "status",     # JSON path; may also hold {job_id}.
                                       # A boolean is accepted: true=succeeded,
-                                      # false=running. A missing path means the
-                                      # provider has no status yet -> queued.
+                                      # false=running. A missing state or a
+                                      # value outside state_map is an ERROR
+                                      # (ADR-0014) unless the seed opts in:
+          "missing_state": "queued",  # optional; e.g. ComfyUI /history is {}
+                                      # until the prompt finishes
+          "unknown_state": "running", # optional; tolerate unmapped values
           "state_map": {"IN_QUEUE": "queued", "IN_PROGRESS": "running",
                         "COMPLETED": "succeeded", "FAILED": "failed"},
           "progress_path": "progress",  # optional; 0..1 fraction or 0..100
@@ -119,14 +126,61 @@ from the submit URL) is available in the ``status`` / ``result`` / ``upload``
 URL templates, so pointing the seed at a new machine means changing only the
 submit URL (usually an ``env:`` reference). See ``docs/PROVIDERS.md``.
 
-ComfyUI img2img fits the same schema: the ``upload`` block POSTs the input
-image to ``{base_url}/upload/image`` (multipart field ``image``, form fields
-``overwrite=true`` + ``type=input``) and the response's ``name`` lands in
-``{uploaded_image}`` for the workflow's ``LoadImage`` node::
+Provider input contract (ADR-0014, models_lib/contract.py): the submit
+payload carries ``prompt``, ``negative_prompt`` (default ""), ``seed``,
+``width``/``height`` and, when resolved, the LOCAL file paths ``init_image``,
+``mask`` and ``reference_image`` (+ ``reference_weight``). A template may use
+``{<file key>_data_uri}`` to inline a file as a base64 data URI. Optional
+contract keys rendered as an exact placeholder are DROPPED from the body when
+absent. A payload editing input (``init_image``/``mask``) that the seed's
+templates do not consume is rejected before any HTTP call (never silently
+ignored).
+
+Bounds (ADR-0014): one monotonic deadline per provider job
+(``defaults.HTTP_JOB_TOTAL_DEADLINE_SEC``, submit -> end of download).
+Every request — upload, submit, status, result, download, and the error
+body of any of them — is streamed (B7-r2 H2): the deadline is re-checked
+per received chunk and, on the real transport, every socket read and every
+partial send is clamped to the time left (B7-r3 H1), so a provider that
+drips bytes or reads a large request slowly cannot stretch one call past
+the deadline. DNS resolution and each connect attempt (one per resolved
+address, full sockaddr incl. IPv6 scope) get only the time left too (B9 M4,
+B9a-r2 M3); at most ``HTTP_DNS_MAX_RESOLVER_THREADS`` resolver threads run
+per process (B9a-r2 M2). Redirects are followed here (<= 5 hops, redirect
+bodies never read; after a cross-origin hop no header value from the seed
+config is sent: auth-like headers are dropped, framing headers re-derived
+from the body, B9 M5 / B9a-r2 M1) and only identity-encoded bodies are
+accepted (B7-r3 M2). ``submit``
+returns a local job handle (``job_handle``: remote id + model id + nonce,
+B7-r3 M5); ``{job_id}`` in URL templates is still the provider's id. A
+persisted handle is restored in another process (``restore``) with the
+registry entry the worker would execute and ONE new total deadline (B9
+M2/M3), started BEFORE the registry read (B9a-r2 M4). Cancel has its own
+short absolute cap (``HTTP_CANCEL_TIMEOUT_SEC``), also started before any
+restore. Each body has a byte cap: JSON responses
+``HTTP_JSON_MAX_BYTES`` (+ the base64 size of the media cap when the
+response carries inline output bytes), error bodies a short snippet, and the
+result download a per-media cap (``HTTP_RESULT_MAX_BYTES_*``) — a lying or
+missing Content-Length cannot bypass any of them. Inline base64 output is
+length-checked BEFORE decoding. Results must pass the Content-Type,
+magic-byte and (images) decode checks (models_lib/media_check.py). Every
+provider text quoted in a message (error snippets, a 200 body's error field,
+state values) is secret-redacted and length-capped (models_lib/redaction.py).
+
+ComfyUI img2img fits the same schema: the ``upload`` block (one dict, or a
+list of them for several files, e.g. image + mask) POSTs the input image to
+``{base_url}/upload/image`` (multipart field ``image``, form fields
+``overwrite=false`` + ``type=input``) and the response's ``name`` (joined
+with a non-empty ``subfolder``) lands in ``{uploaded_image}`` for the
+workflow's ``LoadImage`` node. The multipart filename is unique per submit
+(``hs-<token>-<basename>``, B7-r2 H3) so two jobs whose local files share a
+basename never overwrite each other's input on the provider; the workflow
+references the name the provider RETURNS (it may rename on collision)::
 
     "upload": {"url": "{base_url}/upload/image", "file_param": "image",
                "file_source": "{init_image}", "filename_response_path": "name",
-               "extra_fields": {"overwrite": "true", "type": "input"},
+               "subfolder_response_path": "subfolder",
+               "extra_fields": {"overwrite": "false", "type": "input"},
                "store_as": "uploaded_image"},
     "submit": {"url": "env:COMFYUI_URL", ...,
                "body_template": {"prompt": {
@@ -137,27 +191,414 @@ image to ``{base_url}/upload/image`` (multipart field ``image``, form fields
 from __future__ import annotations
 
 import base64
+import dataclasses
+import ipaddress
+import json
 import logging
 import math
 import mimetypes
 import os
 import re
+import socket
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 
 from app.core import defaults
 from app.core.errors import ErrorCode, StudioError
+from app.models_lib import capabilities, contract, media_check
 from app.models_lib.base import EstimatedCost, JobStatus, ProviderAdapter
+from app.models_lib.redaction import redact as _redact
+
+try:  # the plain/TLS socket stream of httpcore's sync backend (B7-r3 H1)
+    from httpcore._backends.sync import SyncStream as _SyncStream
+except ImportError:  # pragma: no cover - httpcore layout changed
+    _SyncStream = None
 
 log = logging.getLogger(__name__)
 
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-# provider_job_id -> (model_id, http config). The task flow
+# Clock / sleep hooks (tests patch these; never time.* globally).
+_monotonic = time.monotonic
+_sleep = time.sleep
+
+# Optional contract keys: an exact placeholder whose value is absent is
+# dropped from the rendered body instead of failing the submit.
+_OPTIONAL_KEYS = frozenset(
+    [*contract.FILE_KEYS, contract.KEY_REFERENCE_WEIGHT]
+    + [f"{key}_data_uri" for key in contract.FILE_KEYS]
+)
+_DROP = object()
+
+# env: names treated as secrets (redacted from messages, ADR-0014 §4).
+_SECRET_NAME_RE = re.compile(r"(?i)(key|token|secret|password|auth)")
+_ERROR_BODY_READ_BYTES = 4096
+# JSON envelope allowance on top of an inline result's base64 size.
+_INLINE_JSON_SLACK_BYTES = 64 * 1024
+# Redirect hops followed per call (each redirect body is closed unread).
+_MAX_REDIRECTS = 5
+# Write size per clamped call when the socket cannot be driven directly.
+_WRITE_PIECE_BYTES = 16 * 1024
+# Cap of a whole message built from provider text/metadata (after redaction).
+_MESSAGE_MAX_CHARS = 1000
+# Cap of a provider job handle quoted in a message.
+_ID_QUOTE_CHARS = 120
+
+
+def _b64_len(n: int) -> int:
+    """Length of the base64 text of n bytes (no whitespace, padded)."""
+    return 4 * math.ceil(n / 3)
+
+
+# ---------------------------------------------------------------------------
+# Absolute deadline on the real transport (B7-r2 H2)
+#
+# httpx timeouts apply per socket operation: a provider that sends one byte
+# just inside the read timeout, forever, never trips them. The per-chunk
+# check in ``_stream`` stops a dripping BODY; this backend wrapper also
+# clamps every socket connect/read/write (headers included) to the time
+# left before the current call's absolute deadline.
+# ---------------------------------------------------------------------------
+
+_call_deadline = threading.local()
+
+
+def _clamped(timeout: float | None, exc: type[Exception]) -> float | None:
+    deadline = getattr(_call_deadline, "value", None)
+    if deadline is None:
+        return timeout
+    remaining = deadline - _monotonic()
+    if remaining <= 0:
+        raise exc("provider call deadline reached")
+    return remaining if timeout is None else min(timeout, remaining)
+
+
+class _DeadlineStream(httpcore.NetworkStream):
+    def __init__(self, inner: httpcore.NetworkStream) -> None:
+        self._inner = inner
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._inner.read(max_bytes, _clamped(timeout, httpcore.ReadTimeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        """Send under the call deadline, re-checked on EVERY partial send.
+
+        httpcore's ``SyncStream.write`` loops ``sock.send`` with one fixed
+        timeout, so a slow reader could stretch one large write (a big JSON
+        or data-URI body is a single chunk) far past the deadline (B7-r3
+        H1). Here each ``send`` gets the time left; at the deadline the
+        write fails with WriteTimeout.
+        """
+        if getattr(_call_deadline, "value", None) is None or not buffer:
+            self._inner.write(buffer, timeout)
+            return
+        sock = (
+            self._inner.get_extra_info("socket")
+            if _SyncStream is not None and isinstance(self._inner, _SyncStream)
+            else None
+        )
+        view = memoryview(buffer)
+        if sock is None:
+            # Stream we cannot drive directly (e.g. TLS inside a TLS proxy):
+            # bounded pieces, each with the time left.
+            for start in range(0, len(view), _WRITE_PIECE_BYTES):
+                piece = bytes(view[start : start + _WRITE_PIECE_BYTES])
+                self._inner.write(piece, _clamped(timeout, httpcore.WriteTimeout))
+            return
+        try:
+            while view:
+                sock.settimeout(_clamped(timeout, httpcore.WriteTimeout))
+                sent = sock.send(view)
+                view = view[sent:]
+        except socket.timeout as exc:
+            raise httpcore.WriteTimeout(str(exc)) from exc
+        except OSError as exc:
+            raise httpcore.WriteError(str(exc)) from exc
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        return _DeadlineStream(
+            self._inner.start_tls(
+                ssl_context, server_hostname, _clamped(timeout, httpcore.ConnectTimeout)
+            )
+        )
+
+    def get_extra_info(self, info: str):
+        return self._inner.get_extra_info(info)
+
+
+# Resolver threads still running in this process (B9a-r2 M2). A slot is
+# held from thread start until getaddrinfo RETURNS, also after its caller
+# gave up at the deadline; the cap is ``defaults.HTTP_DNS_MAX_RESOLVER_THREADS``.
+_dns_slots = threading.Condition()
+_dns_active = 0
+
+
+def _dns_acquire(wait: float | None) -> None:
+    """Take one resolver slot, waiting at most ``wait`` seconds (the time
+    left before the call deadline); none free in time -> ConnectTimeout."""
+    global _dns_active
+    with _dns_slots:
+        if not _dns_slots.wait_for(
+            lambda: _dns_active < defaults.HTTP_DNS_MAX_RESOLVER_THREADS, wait
+        ):
+            raise httpcore.ConnectTimeout(
+                "provider call deadline reached (waiting for a DNS resolver slot)"
+            )
+        _dns_active += 1
+
+
+def _dns_release() -> None:
+    global _dns_active
+    with _dns_slots:
+        _dns_active -= 1
+        _dns_slots.notify_all()
+
+
+def _resolve_bounded(
+    host: str, port: int, timeout: float | None
+) -> list[tuple[int, int, int, tuple]]:
+    """``(family, type, proto, sockaddr)`` of ``host``, resolved within the
+    time left (B9 M4).
+
+    ``getaddrinfo`` has no timeout of its own: it runs on a daemon thread and
+    the caller waits at most the time left before the call deadline. At most
+    ``HTTP_DNS_MAX_RESOLVER_THREADS`` such threads exist per process: a
+    resolver hanging past its caller's deadline keeps its slot until it
+    returns, and waiting for a free slot counts against the same deadline
+    (B9a-r2 M2). The full sockaddr is kept (IPv6 flow info and scope id;
+    duplicates are dropped per family + sockaddr, so the same link-local
+    address on two interfaces stays two addresses; B9a-r2 M3). IP literals
+    are converted without a lookup (numeric only, cannot block).
+    """
+    try:
+        ipaddress.ip_address(host)
+        literal = True
+    except ValueError:
+        literal = False
+    if literal:
+        try:
+            infos = socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+            )
+        except OSError as exc:
+            raise httpcore.ConnectError(f"invalid address: {exc}") from exc
+    else:
+        _dns_acquire(_clamped(timeout, httpcore.ConnectTimeout))
+        try:
+            # The wait for a slot came out of the same budget.
+            wait = _clamped(timeout, httpcore.ConnectTimeout)
+            box: dict = {}
+            done = threading.Event()
+
+            def _run() -> None:
+                try:
+                    box["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                except Exception as exc:  # noqa: BLE001 (reported by the caller below)
+                    box["error"] = exc
+                finally:
+                    _dns_release()  # the slot is held until the resolver returns
+                    done.set()
+
+            threading.Thread(target=_run, name="http-polling-dns", daemon=True).start()
+        except BaseException:
+            _dns_release()  # no thread took the slot over
+            raise
+        if not done.wait(wait):
+            raise httpcore.ConnectTimeout("provider call deadline reached (DNS resolution)")
+        error = box.get("error")
+        if error is not None:
+            raise httpcore.ConnectError(f"DNS resolution failed: {error}") from error
+        infos = box["infos"]
+    addresses: list[tuple[int, int, int, tuple]] = []
+    seen: set[tuple[int, tuple]] = set()
+    for family, socktype, proto, _canon, sockaddr in infos:
+        key = (family, tuple(sockaddr))
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append((family, socktype, proto, tuple(sockaddr)))
+    if not addresses:
+        raise httpcore.ConnectError("DNS resolution returned no address")
+    return addresses
+
+
+class _DeadlineBackend(httpcore.NetworkBackend):
+    def __init__(self, inner: httpcore.NetworkBackend) -> None:
+        self._inner = inner
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        """Connect under the call deadline (B9 M4).
+
+        The stdlib ``socket.create_connection`` re-applies ONE timeout to
+        every resolved address, so a host with N unreachable addresses took
+        N x the time left, and its DNS lookup was unbounded. Here DNS is
+        bounded by the time left, then each address is tried in turn with
+        the time left recomputed before each attempt; once it is used up the
+        connect fails with ConnectTimeout (-> the adapter's deadline error).
+        The cancel cap runs through the same path.
+        """
+        if getattr(_call_deadline, "value", None) is None:
+            return _DeadlineStream(
+                self._inner.connect_tcp(host, port, timeout, local_address, socket_options)
+            )
+        last: Exception | None = None
+        for family, socktype, proto, sockaddr in _resolve_bounded(host, port, timeout):
+            attempt = _clamped(timeout, httpcore.ConnectTimeout)
+            try:
+                stream = self._connect_one(
+                    family, socktype, proto, sockaddr, attempt, local_address,
+                    socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last = exc
+                continue
+            return _DeadlineStream(stream)
+        _clamped(timeout, httpcore.ConnectTimeout)  # deadline used up -> ConnectTimeout
+        if last is not None:
+            raise last
+        raise httpcore.ConnectError("no address to connect to")
+
+    def _connect_one(
+        self, family, socktype, proto, sockaddr, timeout, local_address, socket_options
+    ):
+        """One attempt at exactly ``sockaddr`` (B9a-r2 M3).
+
+        The stdlib/httpcore path takes a host STRING and resolves it again,
+        which loses the family and an IPv6 scope id (``fe80::1%7`` would go
+        out on scope 0). On httpcore's sync backend the socket is opened
+        here from the resolved tuple, mirroring ``SyncBackend.connect_tcp``
+        (same options, TCP_NODELAY, same exception mapping). Another backend
+        gets the numeric host with ``%scope`` appended for a scoped address.
+        """
+        if _SyncStream is None or not isinstance(self._inner, httpcore.SyncBackend):
+            host = str(sockaddr[0])
+            if family == socket.AF_INET6 and len(sockaddr) >= 4 and sockaddr[3]:
+                host = f"{host}%{sockaddr[3]}"
+            return self._inner.connect_tcp(
+                host, sockaddr[1], timeout, local_address, socket_options
+            )
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            if local_address is not None:
+                sock.bind((local_address, 0))
+            sock.connect(sockaddr)
+            for option in socket_options or ():
+                sock.setsockopt(*option)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except socket.timeout as exc:
+            if sock is not None:
+                sock.close()
+            raise httpcore.ConnectTimeout(str(exc)) from exc
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            raise httpcore.ConnectError(str(exc)) from exc
+        return _SyncStream(sock)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        return _DeadlineStream(
+            self._inner.connect_unix_socket(
+                path, _clamped(timeout, httpcore.ConnectTimeout), socket_options
+            )
+        )
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+def _install_deadline_backend(client: httpx.Client) -> bool:
+    """Wrap the network backend of the client's default + proxy transports.
+
+    Uses httpx/httpcore internals (``_transport``/``_mounts``/``_pool``),
+    guarded: when they change, the per-chunk deadline check still bounds
+    response bodies, and the localhost slow-drip tests flag the regression.
+    """
+    installed = False
+    transports = [getattr(client, "_transport", None)]
+    transports += list((getattr(client, "_mounts", None) or {}).values())
+    for transport in transports:
+        pool = getattr(transport, "_pool", None)
+        backend = getattr(pool, "_network_backend", None)
+        if backend is None:
+            continue
+        if not isinstance(backend, _DeadlineBackend):
+            pool._network_backend = _DeadlineBackend(backend)
+        installed = True
+    return installed
+
+
+@contextmanager
+def _bounded(deadline: float | None):
+    previous = getattr(_call_deadline, "value", None)
+    _call_deadline.value = deadline
+    try:
+        yield
+    finally:
+        _call_deadline.value = previous
+
+
+class _Reply:
+    """A provider response whose body was received under the deadline and
+    byte cap (``error`` bodies are truncated to a snippet)."""
+
+    __slots__ = ("status_code", "headers", "content")
+
+    def __init__(self, status_code: int, headers: httpx.Headers, content: bytes) -> None:
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", "replace")
+
+    def json(self):
+        return json.loads(self.content)
+
+
+def _env_secret_names(cfg, *, in_headers: bool = False) -> set[str]:
+    """env: variable names whose values must never appear in messages:
+    every reference inside a ``headers`` block, plus key/token-like names."""
+    names: set[str] = set()
+    if isinstance(cfg, str):
+        if cfg.startswith("env:") and (in_headers or _SECRET_NAME_RE.search(cfg[4:])):
+            names.add(cfg[4:])
+    elif isinstance(cfg, dict):
+        for k, v in cfg.items():
+            names |= _env_secret_names(v, in_headers=in_headers or k == "headers")
+    elif isinstance(cfg, (list, tuple)):
+        for v in cfg:
+            names |= _env_secret_names(v, in_headers=in_headers)
+    return names
+
+
+def _deadline_error(job_ref: str) -> StudioError:
+    """`job_ref` must already be redacted + capped (HttpPollingAdapter._ref):
+    truncating a raw id first would cut a reflected secret so the exact-match
+    redaction no longer finds it (review B7R3-M1)."""
+    return StudioError(
+        ErrorCode.PROVIDER_ERROR,
+        f"Provider job {job_ref or '(submit)'} exceeded the total "
+        f"deadline ({defaults.HTTP_JOB_TOTAL_DEADLINE_SEC:.0f}s); provider "
+        "cancel requested.",
+        retryable=False,
+        details={"reason": "deadline_exceeded"},
+    )
+
+# Provider job HANDLE (see ``job_handle``) -> (model_id, http config). The task flow
 # (submit -> poll_until_done -> fetch_result) runs inside one task process,
 # so the adapter instance that submitted the job is the one that polls it —
 # same pattern as the stub adapter. Bounded to avoid unbounded growth in
@@ -165,6 +606,40 @@ _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _MAX_REMEMBERED_JOBS = 10_000
 
 _TERMINAL_STATES = ("queued", "running", "succeeded", "failed")
+
+
+def job_handle(remote_id: str, model_id: str) -> str:
+    """Local provider job handle: ``<remote id>@<model id>#<nonce>``
+    (B7-r3 M5).
+
+    The adapter is a process-wide singleton and two endpoints may hand out
+    the same remote id ("1"); in-flight state is keyed by this handle, never
+    by the bare remote id. The handle is what callers persist as
+    ``provider_job_id``: it keeps the remote id readable and names the model,
+    so a later process can still poll / fetch / cancel it (``_lookup``
+    rebuilds the config from the registry). Model ids never contain ``@`` or
+    ``#``; a remote id may (the handle is parsed from the right).
+    """
+    return f"{remote_id}@{model_id}#{uuid.uuid4().hex[:8]}"
+
+
+def parse_job_handle(handle: str) -> tuple[str, str] | None:
+    """(remote id, model id) of a handle; None for anything else (e.g. a
+    bare remote id persisted before B7-r3)."""
+    head, sep, nonce = str(handle).rpartition("#")
+    if not sep or not nonce:
+        return None
+    remote, sep, model_id = head.rpartition("@")
+    if not sep or not remote or not model_id:
+        return None
+    return remote, model_id
+
+
+def remote_job_id(handle: str) -> str:
+    """The provider's own job id inside a handle (the handle itself if it
+    is not one)."""
+    parsed = parse_job_handle(handle)
+    return parsed[0] if parsed else str(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +678,9 @@ def _resolve_env(value, *, model_id: str):
     return value
 
 
-def _lookup_placeholder(name: str, ctx: dict, model_id: str):
+def _lookup_placeholder(name: str, ctx: dict, model_id: str, *, optional: bool = False):
+    if optional and name in _OPTIONAL_KEYS and ctx.get(name) in (None, ""):
+        return _DROP
     if name not in ctx or ctx[name] is None:
         raise StudioError(
             ErrorCode.MODEL_UNAVAILABLE,
@@ -225,14 +702,16 @@ def _render(value, ctx: dict, *, model_id: str):
             return value
         full = _PLACEHOLDER_RE.fullmatch(value)
         if full:
-            return _lookup_placeholder(full.group(1), ctx, model_id)
+            return _lookup_placeholder(full.group(1), ctx, model_id, optional=True)
         return _PLACEHOLDER_RE.sub(
             lambda m: str(_lookup_placeholder(m.group(1), ctx, model_id)), value
         )
     if isinstance(value, dict):
-        return {k: _render(v, ctx, model_id=model_id) for k, v in value.items()}
+        rendered = {k: _render(v, ctx, model_id=model_id) for k, v in value.items()}
+        return {k: v for k, v in rendered.items() if v is not _DROP}
     if isinstance(value, (list, tuple)):
-        return [_render(v, ctx, model_id=model_id) for v in value]
+        rendered = [_render(v, ctx, model_id=model_id) for v in value]
+        return [v for v in rendered if v is not _DROP]
     return value
 
 
@@ -271,11 +750,41 @@ def _origin(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def _decode_inline_bytes(value: str) -> bytes:
-    """Decode base64 output bytes, tolerating a ``data:...;base64,`` prefix."""
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# Request framing/representation headers httpx manages on a redirect hop:
+# not dropped with the configured headers, but a VALUE the seed supplied for
+# one of them never crosses origins either (B9a-r2 M1; an env: value such
+# as "application/json; api_key=..." is still a secret). httpx resets Host
+# on a cross-origin hop and Accept-Encoding is always our own "identity";
+# the rest (_REDIRECT_REFRAME_HEADERS) is re-derived from the body.
+_REDIRECT_KEEP_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "content-type", "accept-encoding"}
+)
+_REDIRECT_REFRAME_HEADERS = frozenset({"content-length", "transfer-encoding", "content-type"})
+
+
+def _origin_key(url: httpx.URL) -> tuple[str, str, int | None]:
+    """(scheme, host, port) with the scheme's default port filled in."""
+    scheme = url.scheme.lower()
+    return scheme, (url.host or "").lower(), url.port or _DEFAULT_PORTS.get(scheme)
+
+
+def _decode_inline_bytes(value: str, *, max_bytes: int | None = None, what: str = "") -> bytes:
+    """Decode base64 output bytes, tolerating a ``data:...;base64,`` prefix.
+
+    The encoded length is checked against the media cap BEFORE decoding
+    (B7-r2 M2): an oversized result is rejected without allocating it.
+    """
     text = value.strip()
     if text.startswith("data:") and "," in text:
         text = text.split(",", 1)[1]
+    if max_bytes is not None and len(text) > _b64_len(max_bytes):
+        raise StudioError(
+            ErrorCode.PROVIDER_ERROR,
+            f"{what or 'Inline output'}: inline result exceeds the size cap "
+            f"({len(text)} base64 chars > {_b64_len(max_bytes)} for {max_bytes} bytes).",
+            details={"reason": "result_too_large", "max_bytes": max_bytes},
+        )
     try:
         return base64.b64decode(text, validate=True)
     except (ValueError, base64.binascii.Error) as e:
@@ -307,14 +816,22 @@ class HttpPollingAdapter(ProviderAdapter):
         self._transport = transport
         self._client: httpx.Client | None = None
         self._jobs: dict[str, tuple[str, dict]] = {}
+        # handle -> monotonic job deadline / media kind / remote id (ADR-0014).
+        self._deadlines: dict[str, float] = {}
+        self._modality: dict[str, str] = {}
+        self._remote: dict[str, str] = {}
+        # env: variable names whose values are redacted from messages.
+        self._secret_names: set[str] = set()
 
     # -- internals ------------------------------------------------------
 
     def _client_conn(self) -> httpx.Client:
         if self._client is None:
             try:
+                # Redirects are followed by ``_stream`` itself (bounded hops,
+                # redirect bodies never read; B7-r3 M2).
                 self._client = httpx.Client(
-                    transport=self._transport, timeout=30.0, follow_redirects=True
+                    transport=self._transport, timeout=30.0, follow_redirects=False
                 )
             except Exception as e:  # noqa: BLE001 (defensive: see below)
                 # Ambient proxy env can be unparseable — e.g. a bracketed IPv6
@@ -333,16 +850,19 @@ class HttpPollingAdapter(ProviderAdapter):
                 self._client = httpx.Client(
                     transport=self._transport,
                     timeout=30.0,
-                    follow_redirects=True,
+                    follow_redirects=False,
                     trust_env=False,
                 )
+            if self._transport is None:
+                _install_deadline_backend(self._client)
         return self._client
 
-    def _http_config(self, model_id: str) -> dict:
-        # Deferred import: registry imports this module at load time.
-        from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
+    def _http_config(self, model_id: str, model: dict | None = None) -> dict:
+        if model is None:
+            # Deferred import: registry imports this module at load time.
+            from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
 
-        model = registry.get_model(model_id)  # raises NOT_FOUND when unknown
+            model = registry.get_model(model_id)  # raises NOT_FOUND when unknown
         http = (model.get("capabilities") or {}).get("http")
         if not isinstance(http, dict) or not http:
             raise StudioError(
@@ -351,28 +871,187 @@ class HttpPollingAdapter(ProviderAdapter):
                 "http_polling adapter cannot drive it. Add the block to the "
                 "model seed JSON (see this module's docstring).",
             )
+        self._secret_names |= _env_secret_names(http)
         return http
 
-    def _remember(self, model_id: str, cfg: dict, provider_job_id: str) -> None:
+    @staticmethod
+    def _modality_of(model_id: str) -> str:
+        from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
+
+        try:
+            return str(registry.get_model(model_id).get("modality") or "image")
+        except StudioError:
+            return "image"
+
+    def _remember(self, model_id: str, cfg: dict, provider_job_id: str, remote_id: str) -> None:
         self._jobs[provider_job_id] = (model_id, cfg)
+        self._remote[provider_job_id] = remote_id
         while len(self._jobs) > _MAX_REMEMBERED_JOBS:
-            self._jobs.pop(next(iter(self._jobs)))
+            oldest = next(iter(self._jobs))
+            self._jobs.pop(oldest)
+            self._deadlines.pop(oldest, None)
+            self._modality.pop(oldest, None)
+            self._remote.pop(oldest, None)
+
+    def deadline_for(self, provider_job_id: str) -> float | None:
+        """Monotonic deadline of a submitted job (poll_until_done uses it).
+
+        A persisted handle unknown to this process is restored first (B9
+        M2), so the deadline poll_until_done reads is the one the HTTP calls
+        enforce. A FAILED restore still returns the deadline it started
+        (B9a-r3 M1): poll_until_done never starts a second job budget, and
+        poll's re-restore only gets what is left of it. None only when the
+        id is not a handle at all (poll then raises).
+        """
+        deadline = self._deadlines.get(provider_job_id)
+        if deadline is None and provider_job_id not in self._jobs:
+            try:
+                self._restore(provider_job_id, None)
+            except Exception:  # noqa: BLE001 (poll reports the same failure)
+                pass
+            deadline = self._deadlines.get(provider_job_id)
+        return deadline
+
+    def _secrets(self) -> list[str]:
+        return [os.environ[n] for n in self._secret_names if os.environ.get(n)]
+
+    def _quote(self, text) -> str:
+        """Provider text for a message: secret-redacted and length-capped."""
+        return _redact(str(text), self._secrets(), limit=defaults.HTTP_ERROR_SNIPPET_CHARS)
+
+    def _ref(self, provider_job_id: str) -> str:
+        """A job handle quoted in a message (provider metadata: redacted,
+        capped)."""
+        return _redact(str(provider_job_id), self._secrets(), limit=_ID_QUOTE_CHARS)
+
+    def sanitize_message(self, text: str) -> str:
+        """Final gate for any message leaving the adapter (B7-r3 M1): every
+        quoted provider value — snippets, ids, URLs, header values — is
+        redacted BEFORE the whole message is length-capped."""
+        return _redact(str(text), self._secrets(), limit=_MESSAGE_MAX_CHARS)
+
+    def _sanitized(self, exc: StudioError) -> StudioError:
+        exc.message = self.sanitize_message(exc.message)
+        exc.args = (exc.message,)
+        return exc
+
+    def _json_cap(self, cfg: dict, modality: str, *, carries_result: bool) -> int:
+        """Byte cap of a JSON response; one that may carry inline output
+        bytes also gets the base64 size of the media cap."""
+        cap = int(defaults.HTTP_JSON_MAX_BYTES)
+        res = cfg.get("result") or {}
+        media_cap = media_check.max_bytes(modality)
+        if carries_result and res.get("output_bytes_path") and media_cap is not None:
+            cap += _b64_len(media_cap) + _INLINE_JSON_SLACK_BYTES
+        return cap
+
+    def _check_deadline(self, provider_job_id: str) -> None:
+        deadline = self._deadlines.get(provider_job_id)
+        if deadline is not None and _monotonic() >= deadline:
+            raise _deadline_error(self._ref(provider_job_id))
+
+    def _timeout(self, configured: float, deadline: float | None, job: str) -> float:
+        """Request timeout capped by the time left before the job deadline."""
+        if deadline is None:
+            return configured
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            raise _deadline_error(self._ref(job))
+        return min(configured, remaining)
 
     def _lookup(self, provider_job_id: str) -> tuple[str, dict]:
+        return self._restore(provider_job_id, None)
+
+    def restore(self, provider_job_id: str, model: dict | None = None) -> None:
+        """Rebuild the in-flight state of a persisted handle in THIS process
+        (restart / reconcile; B9 M2/M3). poll/fetch_result/cancel/deadline_for
+        call it implicitly with ``model=None``.
+
+        Config: ``model`` is the registry entry the caller resolved (e.g.
+        ``registry.get_model(model_id, db)``, the worker's DB overlay); its
+        ``model_id`` must match the handle. Without it the entry comes from
+        ``registry.resolve_model``: the pinned entry (``pinned_model``), else
+        the DB overlay read in its own session — the seed only when the model
+        has no DB row, and a DB failure is an error, never a seed fallback.
+
+        Deadline: a restored handle starts ONE new total deadline
+        (``HTTP_JOB_TOTAL_DEADLINE_SEC`` from the restore ENTRY, so the
+        registry/DB read counts against it; the original one is not
+        recoverable), stored on the adapter and shared by polling and the
+        result fetch. The DB read gets the time left as its bound
+        (``registry.resolve_model(timeout=...)``; B9a-r2 M4). A handle this
+        adapter already tracks keeps its state, but an explicit ``model``
+        must still name the handle's model (B9a-r2 M5). A failure message
+        names model ids only, never the provider's remote id (B9a-r2 M6).
+        """
         try:
-            return self._jobs[provider_job_id]
-        except KeyError:
+            self._restore(provider_job_id, model)
+        except StudioError as exc:
+            raise self._sanitized(exc)
+
+    def _restore(
+        self, provider_job_id: str, model: dict | None, *, budget: float | None = None
+    ) -> tuple[str, dict]:
+        """See ``restore``. ``budget``: an absolute monotonic bound of the
+        registry read used INSTEAD of the job deadline (cancel's own cap);
+        it never changes the job deadline."""
+        # Started at ENTRY: the registry/DB read counts against it (B9a-r2 M4).
+        # A handle whose earlier restore failed keeps the deadline that
+        # attempt started: one job budget per handle, never restarted
+        # (B9a-r3 M1).
+        deadline = self._deadlines.get(provider_job_id)
+        if deadline is None:
+            deadline = _monotonic() + defaults.HTTP_JOB_TOTAL_DEADLINE_SEC
+        entry = self._jobs.get(provider_job_id)
+        parsed = parse_job_handle(provider_job_id)
+        if model is not None:
+            # Checked before the cache hit (B9a-r2 M5). Model ids only: the
+            # secrets of this model are not collected yet, so a reflected
+            # remote id is never quoted here (B9a-r2 M6).
+            expected = entry[0] if entry is not None else (parsed[1] if parsed else None)
+            if expected is not None and model.get("model_id") != expected:
+                raise StudioError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"Cannot restore a provider job of model "
+                    f"{str(expected)[:_ID_QUOTE_CHARS]!r} with the registry entry of "
+                    f"model {str(model.get('model_id'))[:_ID_QUOTE_CHARS]!r}.",
+                )
+        if entry is not None:
+            return entry
+        if parsed is None:
+            # No model -> no secrets to redact with: the id is not quoted (M6).
             raise StudioError(
                 ErrorCode.MODEL_UNAVAILABLE,
-                f"Unknown provider job id {provider_job_id!r}; it was not "
-                "submitted through this adapter instance.",
-            ) from None
+                "Unknown provider job id (not a '<remote id>@<model id>#<nonce>' "
+                "handle); it was not submitted through this adapter instance.",
+            )
+        remote, model_id = parsed
+        if model is None:
+            from app.models_lib import registry  # noqa: PLC0415 (deferred: same module)
+
+            # Remembered BEFORE the read: if it fails, the next attempt
+            # (poll after deadline_for) only gets the time left (B9a-r3 M1).
+            self._deadlines.setdefault(provider_job_id, deadline)
+            while len(self._deadlines) > _MAX_REMEMBERED_JOBS:
+                self._deadlines.pop(next(iter(self._deadlines)))
+            bound = deadline if budget is None else budget
+            model = registry.resolve_model(model_id, timeout=bound - _monotonic())
+        cfg = self._http_config(model_id, model)
+        self._remember(model_id, cfg, provider_job_id, remote)
+        self._modality[provider_job_id] = str(model.get("modality") or "image")
+        self._deadlines[provider_job_id] = deadline
+        return model_id, cfg
 
     def _ctx(self, model_id: str, provider_job_id: str, cfg: dict, payload: dict) -> dict:
         ctx: dict = {}
         ctx.update(payload)
         ctx["model_id"] = model_id
-        ctx["job_id"] = provider_job_id
+        # URL templates take the PROVIDER's id, never the local handle.
+        ctx["job_id"] = (
+            self._remote.get(provider_job_id) or remote_job_id(provider_job_id)
+            if provider_job_id
+            else ""
+        )
         submit_url = str((cfg.get("submit") or {}).get("url") or "")
         ctx["base_url"] = _origin(_resolve_env(submit_url, model_id=model_id))
         return ctx
@@ -388,36 +1067,216 @@ class HttpPollingAdapter(ProviderAdapter):
         files=None,
         timeout: float,
         what: str,
-    ) -> httpx.Response:
-        """One HTTP call. Network-level failures become StudioError(PROVIDER_ERROR).
+        deadline: float | None = None,
+        job: str = "",
+        max_bytes: int | None = None,
+    ) -> _Reply:
+        """One JSON-ish HTTP call, body capped at ``max_bytes`` (default
+        ``HTTP_JSON_MAX_BYTES``). See ``_stream``."""
+        cap = int(defaults.HTTP_JSON_MAX_BYTES) if max_bytes is None else max_bytes
+        return self._stream(
+            method, url, headers=headers, json_body=json_body, data=data,
+            files=files, timeout=timeout, what=what, deadline=deadline, job=job,
+            max_bytes=cap,
+        )
 
-        Raw httpx exceptions never escape this adapter (base.py contract).
+    def _stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict | None,
+        timeout: float,
+        what: str,
+        deadline: float | None,
+        job: str = "",
+        max_bytes: int | None,
+        json_body=None,
+        data=None,
+        files=None,
+        on_headers=None,
+        on_overflow=None,
+    ) -> _Reply:
+        """One HTTP call, the whole response received under the deadline.
+
+        The body is streamed: the absolute deadline is re-checked per chunk
+        (and per socket operation on the real transport) and ``max_bytes``
+        caps it — a declared Content-Length over the cap is rejected before
+        reading. An error status (>= 400) body is read only up to a short
+        snippet. Network failures and the deadline become StudioError; raw
+        httpx exceptions never escape (base.py contract).
         """
+        timeout = self._timeout(timeout, deadline, job)
+        # Compressed bodies are refused (B7-r3 M2): a decoder allocates its
+        # output before any cap could see it.
+        req_headers = {
+            k: v for k, v in (headers or {}).items() if str(k).lower() != "accept-encoding"
+        }
+        req_headers["Accept-Encoding"] = "identity"
         try:
-            return self._client_conn().request(
-                method,
-                url,
-                headers=headers or None,
-                json=json_body,
-                data=data,
-                files=files,
-                timeout=timeout,
-            )
+            with _bounded(deadline):
+                client = self._client_conn()
+                request = client.build_request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    json=json_body,
+                    data=data,
+                    files=files,
+                    timeout=timeout,
+                )
+                # Header values from the seed config (auth or otherwise)
+                # never leave the original origin (B9 M5, B9a-r2 M1).
+                configured = {str(k).lower() for k in (headers or {})}
+                seed_framing = configured & _REDIRECT_REFRAME_HEADERS
+                configured -= _REDIRECT_KEEP_HEADERS
+                origin = _origin_key(request.url)
+                crossed = False
+                body_resent = True
+                for _hop in range(_MAX_REDIRECTS + 1):
+                    resp = client.send(request, stream=True, follow_redirects=False)
+                    try:
+                        if resp.next_request is not None:
+                            # Redirect: its body is closed UNREAD (B7-r3 M2);
+                            # httpx builds the next request (method change,
+                            # cross-origin Authorization stripped). Once a hop
+                            # leaves the origin (scheme, host or port), every
+                            # configured header is dropped for the rest of
+                            # the chain, also on a hop back to the origin, and
+                            # a seed-set framing header is re-derived.
+                            previous, request = request, resp.next_request
+                            if request.method != previous.method and request.method == "GET":
+                                body_resent = False  # httpx drops the body here
+                            crossed = crossed or _origin_key(request.url) != origin
+                            if crossed:
+                                for name in configured:
+                                    request.headers.pop(name, None)
+                                if seed_framing:
+                                    self._reframe(
+                                        request, seed_framing, body_resent=body_resent,
+                                        json_body=json_body, data=data, files=files,
+                                        what=what,
+                                    )
+                            if deadline is not None and _monotonic() >= deadline:
+                                raise _deadline_error(self._ref(job))
+                            continue
+                        return self._receive(
+                            resp, what=what, deadline=deadline, job=job,
+                            max_bytes=max_bytes, on_headers=on_headers,
+                            on_overflow=on_overflow,
+                        )
+                    finally:
+                        resp.close()
+                raise StudioError(
+                    ErrorCode.PROVIDER_ERROR,
+                    f"{what}: more than {_MAX_REDIRECTS} redirects.",
+                    details={"reason": "too_many_redirects"},
+                )
         except httpx.HTTPError as e:
+            if deadline is not None and _monotonic() >= deadline:
+                raise _deadline_error(self._ref(job)) from e
+            secrets = self._secrets() + [str(v) for v in (headers or {}).values()]
             raise StudioError(
                 ErrorCode.PROVIDER_ERROR,
-                f"{what}: network error ({e.__class__.__name__}: {e}).",
+                _redact(
+                    f"{what}: network error ({e.__class__.__name__}: {e}).", secrets,
+                    limit=_MESSAGE_MAX_CHARS,
+                ),
             ) from e
 
     @staticmethod
-    def _snippet(resp: httpx.Response) -> str:
+    def _reframe(
+        request: httpx.Request, names: set[str], *, body_resent: bool,
+        json_body, data, files, what: str,
+    ) -> None:
+        """Replace seed-supplied framing headers on a cross-origin hop
+        (B9a-r2 M1).
+
+        The seed's value is never forwarded: each header gets the value httpx
+        derives from the body itself (JSON / form / empty body), or is
+        dropped when the hop re-sends no body (e.g. 303 -> GET). A multipart
+        body cannot be re-derived (its boundary came from the seed's
+        Content-Type), so re-sending it to another origin is refused.
+        """
+        if body_resent and files:
+            raise StudioError(
+                ErrorCode.PROVIDER_ERROR,
+                f"{what}: a redirect to another origin would re-send a multipart "
+                "body framed by the seed's own header(s) "
+                f"({', '.join(sorted(names))}); refused (seed header values never "
+                "leave the original origin).",
+                details={"reason": "redirect_reframe_refused"},
+            )
+        derived = (
+            httpx.Request(request.method, request.url, json=json_body, data=data).headers
+            if body_resent
+            else httpx.Headers()
+        )
+        for name in names:
+            request.headers.pop(name, None)
+            value = derived.get(name)
+            if value is not None:
+                request.headers[name] = value
+
+    def _receive(
+        self, resp: httpx.Response, *, what: str, deadline: float | None, job: str,
+        max_bytes: int | None, on_headers, on_overflow,
+    ) -> _Reply:
+        """Read one final response: raw bytes (no decoding), deadline and
+        byte cap checked per chunk; an error body only up to a snippet."""
+        error = resp.status_code >= 400
+        encoding = resp.headers.get("content-encoding", "").strip().lower()
+        if encoding not in ("", "identity"):
+            if error:  # status still reported; the body is not decoded
+                return _Reply(resp.status_code, resp.headers, b"")
+            shown = self._quote(encoding)[:40]
+            raise StudioError(
+                ErrorCode.PROVIDER_ERROR,
+                f"{what}: provider sent a {shown!r}-encoded response; only "
+                "identity bodies are accepted (decompression is not bounded).",
+                details={"reason": "response_encoding", "content_encoding": shown},
+            )
+        limit = _ERROR_BODY_READ_BYTES if error else max_bytes
+        if not error:
+            if on_headers is not None:
+                on_headers(resp)
+            declared = resp.headers.get("content-length", "")
+            if limit is not None and declared.isdigit() and int(declared) > limit:
+                self._overflow(int(declared), limit, what, on_overflow)
+        buf = bytearray()
+        # An in-memory response (mock transports) was read at construction;
+        # a network response is streamed raw (never decoded).
+        chunks = [resp.content] if resp.is_stream_consumed else resp.iter_raw()
+        for chunk in chunks:
+            buf.extend(chunk)
+            if deadline is not None and _monotonic() >= deadline:
+                raise _deadline_error(self._ref(job))
+            if limit is not None and len(buf) > limit:
+                if error:
+                    del buf[limit:]
+                    break
+                self._overflow(len(buf), limit, what, on_overflow)
+        return _Reply(resp.status_code, resp.headers, bytes(buf))
+
+    @staticmethod
+    def _overflow(size: int, limit: int, what: str, on_overflow) -> None:
+        if on_overflow is not None:
+            on_overflow(size)
+        raise StudioError(
+            ErrorCode.PROVIDER_ERROR,
+            f"{what}: provider response exceeds the {limit}-byte cap.",
+            details={"reason": "response_too_large", "max_bytes": limit},
+        )
+
+    def _snippet(self, resp: _Reply) -> str:
         try:
             text = resp.text.strip()
         except Exception:  # noqa: BLE001 (best-effort diagnostics)
             return ""
-        return f" Provider response: {text[:300]}" if text else ""
+        text = self._quote(text)
+        return f" Provider response: {text}" if text else ""
 
-    def _raise_for_status(self, resp: httpx.Response, *, what: str) -> None:
+    def _raise_for_status(self, resp: _Reply, *, what: str) -> None:
         status = resp.status_code
         if status < 400:
             return
@@ -432,7 +1291,7 @@ class HttpPollingAdapter(ProviderAdapter):
         )
 
     @staticmethod
-    def _as_json(resp: httpx.Response, *, what: str) -> dict:
+    def _as_json(resp: _Reply, *, what: str) -> dict:
         try:
             data = resp.json()
         except ValueError as e:
@@ -448,20 +1307,41 @@ class HttpPollingAdapter(ProviderAdapter):
             )
         return data
 
-    def _map_state(self, raw, state_map: dict, model_id: str) -> tuple[str, str]:
-        """Provider state value -> (our state, stage label)."""
+    def _map_state(self, raw, st: dict, model_id: str) -> tuple[str, str]:
+        """Provider state value -> (our state, stage label).
+
+        A missing or unmapped state is an error (ADR-0014): "queued forever"
+        hid broken providers. Seeds opt in explicitly with
+        ``status.missing_state`` (e.g. ComfyUI: /history is {} until the
+        prompt finishes) / ``status.unknown_state``.
+        """
+        state_map = st.get("state_map") or {}
         if raw is None or raw is _MISSING:
-            # Provider has no status for the job yet (e.g. ComfyUI history
-            # before the first update): treat as queued, keep polling.
-            return "queued", "submitted"
+            tolerated = st.get("missing_state")
+            if tolerated in ("queued", "running"):
+                return tolerated, "submitted"
+            raise StudioError(
+                ErrorCode.PROVIDER_ERROR,
+                f"Model {model_id}: provider status response has no state at "
+                f"'{st.get('state_path')}'.",
+                details={"reason": "status_missing"},
+            )
         if isinstance(raw, bool):
             return ("succeeded", "completed") if raw else ("running", "in_progress")
         key = str(raw)
         mapped = state_map.get(key)
         if mapped is None:
-            # Unknown provider state: keep polling and surface the raw state in
-            # `stage` instead of failing the job on a provider-side addition.
-            return "running", key
+            tolerated = st.get("unknown_state")
+            shown = self._quote(key)[:100]  # provider text (B7-r2 M1)
+            if tolerated in ("queued", "running"):
+                # Seed opted in: keep polling, surface the raw state.
+                return tolerated, shown
+            raise StudioError(
+                ErrorCode.PROVIDER_ERROR,
+                f"Model {model_id}: unrecognized provider state {shown!r} "
+                "(not in capabilities.http.status.state_map).",
+                details={"reason": "status_unrecognized", "state": shown},
+            )
         if mapped not in _TERMINAL_STATES:
             raise StudioError(
                 ErrorCode.MODEL_UNAVAILABLE,
@@ -469,7 +1349,7 @@ class HttpPollingAdapter(ProviderAdapter):
                 f"{key!r} to invalid state {mapped!r}; must be one of "
                 f"{', '.join(_TERMINAL_STATES)}.",
             )
-        return mapped, key
+        return mapped, self._quote(key)[:100]
 
     def _extract_urls(
         self, value, url_template: str | None, ctx: dict, model_id: str
@@ -513,13 +1393,20 @@ class HttpPollingAdapter(ProviderAdapter):
         url = str(_render(str(url_template), ctx, model_id=model_id))
         headers = _resolve_env(st.get("headers") or {}, model_id=model_id)
         method = str(st.get("method", "GET")).upper()
-        what = f"Status poll for provider job {provider_job_id}"
+        what = f"Status poll for provider job {self._ref(provider_job_id)}"
+        res = cfg.get("result") or {}
+        modality = self._modality.get(provider_job_id) or "image"
         resp = self._call(
             method,
             url,
             headers=headers,
-            timeout=float(cfg.get("poll_timeout_sec", 15.0)),
+            timeout=float(cfg.get("poll_timeout_sec", defaults.HTTP_POLL_TIMEOUT_SEC)),
             what=what,
+            deadline=self._deadlines.get(provider_job_id),
+            job=provider_job_id,
+            # The status body carries the inline output when there is no
+            # separate result endpoint.
+            max_bytes=self._json_cap(cfg, modality, carries_result=not res.get("url")),
         )
         if resp.status_code == 404:
             # The provider no longer knows this job: terminal, not retryable
@@ -527,7 +1414,7 @@ class HttpPollingAdapter(ProviderAdapter):
             return JobStatus(
                 state="failed",
                 error_code=ErrorCode.PROVIDER_ERROR,
-                error_message=f"Provider job {provider_job_id} not found (HTTP 404).",
+                error_message=f"Provider job {self._ref(provider_job_id)} not found (HTTP 404).",
             ), {}
         self._raise_for_status(resp, what=what)
         body = self._as_json(resp, what=what)
@@ -538,7 +1425,7 @@ class HttpPollingAdapter(ProviderAdapter):
             if state_path
             else _MISSING
         )
-        state, stage = self._map_state(raw, st.get("state_map") or {}, model_id)
+        state, stage = self._map_state(raw, st, model_id)
 
         progress = 0.0
         if state == "succeeded":
@@ -558,12 +1445,12 @@ class HttpPollingAdapter(ProviderAdapter):
                     body, str(_render(str(st["error_path"]), ctx, model_id=model_id))
                 )
                 if dug is not None and dug is not _MISSING:
-                    error_message = str(dug)
+                    # Provider text -> error_message: redacted (B7-r2 M1).
+                    error_message = self._quote(dug)
             if error_message is None:
-                error_message = f"Provider job {provider_job_id} failed."
+                error_message = f"Provider job {self._ref(provider_job_id)} failed."
 
         output_urls: list[str] = []
-        res = cfg.get("result") or {}
         if state == "succeeded" and not res.get("url") and res.get("output_url_path"):
             dug = _dig(
                 body, str(_render(str(res["output_url_path"]), ctx, model_id=model_id))
@@ -582,7 +1469,25 @@ class HttpPollingAdapter(ProviderAdapter):
             error_message=error_message,
         ), body
 
-    def _upload_inputs(self, model_id: str, cfg: dict, ctx: dict) -> dict:
+    def _upload_inputs(
+        self, model_id: str, cfg: dict, ctx: dict, deadline: float | None = None
+    ) -> dict:
+        """Run every configured upload (``upload`` is one dict or a list).
+
+        One random token per submit (= per job attempt) prefixes every
+        uploaded filename (B7-r2 H3)."""
+        token = uuid.uuid4().hex[:16]
+        uploads = cfg.get("upload") or []
+        if isinstance(uploads, dict):
+            uploads = [uploads]
+        for up in uploads:
+            ctx = self._upload_one(model_id, up, ctx, deadline, token)
+        return ctx
+
+    def _upload_one(
+        self, model_id: str, up: dict, ctx: dict, deadline: float | None,
+        token: str = "",
+    ) -> dict:
         """Optional pre-submit file upload (e.g. ComfyUI /upload/image).
 
         ``capabilities.http.upload``::
@@ -602,19 +1507,25 @@ class HttpPollingAdapter(ProviderAdapter):
                                                 # rendered against ctx
               "filename_response_path": "name",  # JSON path of the stored
                                                 # filename in the response
+              "subfolder_response_path": "subfolder",  # optional; a non-
+                                                # empty value is joined as
+                                                # "<subfolder>/<name>"
               "store_as": "uploaded_image",      # ctx key the filename lands
                                                 # in (for {..} in the submit
                                                 # body_template)
               "timeout_sec": 60.0,               # optional, default 60
             }
 
-        Returns ctx with ``store_as`` set to the provider's stored filename.
+        Returns ctx with ``store_as`` set to the provider's stored filename
+        — the name the provider RETURNS, never the local basename. The
+        multipart filename is ``hs-<token>-<basename>``: unique per submit,
+        so two jobs whose inputs share a basename never overwrite each
+        other's input on the provider (B7-r2 H3).
         Absent ``upload`` config or absent input file -> ctx unchanged, so a
         text-only job on an upload-capable seed simply skips this step.
         Failures (missing file, HTTP/JSON errors, no filename in the
         response) are StudioError — never raw exceptions.
         """
-        up = cfg.get("upload") or {}
         if not up:
             return ctx
         source_tpl = up.get("file_source")
@@ -661,11 +1572,12 @@ class HttpPollingAdapter(ProviderAdapter):
         fields = _render(up.get("extra_fields") or {}, ctx, model_id=model_id)
         file_param = str(up.get("file_param", "image"))
         store_as = str(up.get("store_as", "uploaded_image"))
-        timeout = float(up.get("timeout_sec", 60.0))
+        timeout = float(up.get("timeout_sec", defaults.HTTP_UPLOAD_TIMEOUT_SEC))
         what = f"Input upload for model {model_id}"
 
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        files = {file_param: (path.name, path.read_bytes(), content_type)}
+        upload_name = f"hs-{token or uuid.uuid4().hex[:16]}-{path.name}"
+        files = {file_param: (upload_name, path.read_bytes(), content_type)}
         resp = self._call(
             method,
             url,
@@ -674,6 +1586,7 @@ class HttpPollingAdapter(ProviderAdapter):
             files=files,
             timeout=timeout,
             what=what,
+            deadline=deadline,
         )
         self._raise_for_status(resp, what=what)
         body = self._as_json(resp, what=what)
@@ -686,13 +1599,83 @@ class HttpPollingAdapter(ProviderAdapter):
                 f"{what}: upload response has no stored filename at "
                 f"'{name_path}'.",
             )
-        ctx[store_as] = str(stored)
-        log.info("Model %s: uploaded %s -> stored as %r.", model_id, path.name, ctx[store_as])
+        stored = str(stored)
+        sub_path = up.get("subfolder_response_path")
+        if sub_path:
+            sub = _dig(body, str(sub_path))
+            if sub is not None and sub is not _MISSING and str(sub).strip("/"):
+                stored = f"{str(sub).strip('/')}/{stored}"
+        ctx[store_as] = stored
+        log.info("Model %s: uploaded %s as %s -> stored as %r.", model_id, path.name,
+                 upload_name, ctx[store_as])
         return ctx
 
     # -- ProviderAdapter interface ------------------------------------
 
+    def _reject_unconsumed(self, model_id: str, cfg: dict, ctx: dict) -> None:
+        """Editing inputs the seed cannot take are rejected, never ignored."""
+        consumed = capabilities.http_placeholders(cfg)
+        extra = [
+            key
+            for key in (contract.KEY_INIT_IMAGE, contract.KEY_MASK)
+            if ctx.get(key) and key not in consumed and f"{key}_data_uri" not in consumed
+        ]
+        if extra:
+            raise StudioError(
+                ErrorCode.VALIDATION_ERROR,
+                f"Model {model_id} cannot take the input(s) {', '.join(extra)}; "
+                "its capabilities.http templates do not consume them.",
+                details={"reason": "input_unsupported", "inputs": extra},
+            )
+
+    @staticmethod
+    def _add_data_uris(model_id: str, cfg: dict, ctx: dict) -> None:
+        """Fill ``{<file key>_data_uri}`` placeholders from local files."""
+        suffix = "_data_uri"
+        for name in capabilities.http_placeholders(cfg):
+            if not name.endswith(suffix):
+                continue
+            local = ctx.get(name[: -len(suffix)])
+            if not local:
+                continue
+            path = Path(str(local))
+            if not path.is_file():
+                raise StudioError(
+                    ErrorCode.PROVIDER_ERROR,
+                    f"Model {model_id}: input file not found: {path}.",
+                )
+            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            ctx[name] = f"data:{mime};base64,{encoded}"
+
     def submit(self, model_id: str, payload: dict) -> str:
+        """Returns the local job HANDLE (``job_handle``), not the bare
+        remote id."""
+        try:
+            return self._submit(model_id, payload)
+        except StudioError as exc:
+            raise self._sanitized(exc)
+
+    def poll(self, provider_job_id: str) -> JobStatus:
+        try:
+            status = self._poll(provider_job_id)
+        except StudioError as exc:
+            raise self._sanitized(exc)
+        if status.error_message:
+            status = dataclasses.replace(
+                status, error_message=self.sanitize_message(status.error_message)
+            )
+        return status
+
+    def fetch_result(self, provider_job_id: str) -> bytes:
+        try:
+            return self._fetch_result(provider_job_id)
+        except StudioError as exc:
+            raise self._sanitized(exc)
+
+    def _submit(self, model_id: str, payload: dict) -> str:
+        # The job deadline starts before the first byte leaves (uploads count).
+        deadline = _monotonic() + defaults.HTTP_JOB_TOTAL_DEADLINE_SEC
         cfg = self._http_config(model_id)
         sub = cfg.get("submit") or {}
         url = _resolve_env(sub.get("url"), model_id=model_id)
@@ -704,7 +1687,10 @@ class HttpPollingAdapter(ProviderAdapter):
         method = str(sub.get("method", "POST")).upper()
         headers = _resolve_env(sub.get("headers") or {}, model_id=model_id)
         ctx = self._ctx(model_id, "", cfg, payload)
-        ctx = self._upload_inputs(model_id, cfg, ctx)
+        ctx.setdefault(contract.KEY_NEGATIVE, "")
+        self._reject_unconsumed(model_id, cfg, ctx)
+        ctx = self._upload_inputs(model_id, cfg, ctx, deadline)
+        self._add_data_uris(model_id, cfg, ctx)
         body = _render(sub.get("body_template") or {}, ctx, model_id=model_id)
 
         what = f"Submit to model {model_id}"
@@ -713,8 +1699,9 @@ class HttpPollingAdapter(ProviderAdapter):
             str(url),
             headers=headers,
             json_body=body,
-            timeout=float(cfg.get("timeout_sec", 30.0)),
+            timeout=float(cfg.get("timeout_sec", defaults.HTTP_SUBMIT_TIMEOUT_SEC)),
             what=what,
+            deadline=deadline,
         )
         self._raise_for_status(resp, what=what)
         data = self._as_json(resp, what=what)
@@ -731,20 +1718,28 @@ class HttpPollingAdapter(ProviderAdapter):
                 ErrorCode.PROVIDER_ERROR,
                 f"{what}: submit response has no job id at '{job_id_path}'.",
             )
-        provider_job_id = str(job_id)
-        self._remember(model_id, cfg, provider_job_id)
+        remote_id = str(job_id)
+        provider_job_id = job_handle(remote_id, model_id)
+        self._remember(model_id, cfg, provider_job_id, remote_id)
+        self._deadlines[provider_job_id] = deadline
+        self._modality[provider_job_id] = self._modality_of(model_id)
         return provider_job_id
 
-    def poll(self, provider_job_id: str) -> JobStatus:
+    def _poll(self, provider_job_id: str) -> JobStatus:
         model_id, cfg = self._lookup(provider_job_id)
+        self._check_deadline(provider_job_id)
         status, _ = self._get_status(provider_job_id, model_id, cfg)
         return status
 
     def cancel(self, provider_job_id: str) -> None:
-        entry = self._jobs.get(provider_job_id)
-        if entry is None:
+        # Not capped by the job deadline (cancel runs after it passed): its
+        # own short absolute cap (B7-r2 H2), started at ENTRY so restoring a
+        # handle (registry/DB read) counts against it too (B9a-r2 M4).
+        cap = _monotonic() + defaults.HTTP_CANCEL_TIMEOUT_SEC
+        try:
+            model_id, cfg = self._restore(provider_job_id, None, budget=cap)
+        except Exception:  # noqa: BLE001 (unknown job: best-effort no-op)
             return None
-        model_id, cfg = entry
         cancel_cfg = cfg.get("cancel")
         if not cancel_cfg:
             # No cancel endpoint configured: best-effort no-op (base.py contract).
@@ -758,8 +1753,11 @@ class HttpPollingAdapter(ProviderAdapter):
                 method,
                 str(url),
                 headers=headers,
-                timeout=10.0,
-                what=f"Cancel provider job {provider_job_id}",
+                timeout=defaults.HTTP_CANCEL_TIMEOUT_SEC,
+                what=f"Cancel provider job {self._ref(provider_job_id)}",
+                deadline=cap,
+                job=provider_job_id,
+                max_bytes=_ERROR_BODY_READ_BYTES,
             )
         except Exception:  # noqa: BLE001 (best-effort cancellation)
             pass
@@ -810,13 +1808,44 @@ class HttpPollingAdapter(ProviderAdapter):
             unit_breakdown=f"{model_id}: {unit} x {qty} @ ${amount} = ${total}",
         )
 
-    def fetch_result(self, provider_job_id: str) -> bytes:
+    def _download(
+        self, url: str, *, timeout: float, what: str, modality: str,
+        deadline: float | None, job: str,
+    ) -> bytes:
+        """Stream the artifact with a per-media byte cap (ADR-0014 §4).
+
+        Content-Length larger than the cap -> rejected before the body is
+        read; a lying/missing Content-Length is caught while streaming.
+        Content-Type and magic bytes must match the media kind.
+        """
+        reply = self._stream(
+            "GET",
+            url,
+            headers=None,
+            timeout=timeout,
+            what=what,
+            deadline=deadline,
+            job=job,
+            max_bytes=media_check.max_bytes(modality),
+            on_headers=lambda resp: media_check.check_content_type(
+                resp.headers.get("content-type"), modality, what=what
+            ),
+            on_overflow=lambda size: media_check.check_size(size, modality, what=what),
+        )
+        self._raise_for_status(reply, what=what)
+        media_check.check_media(reply.content, modality, what=what)
+        return reply.content
+
+    def _fetch_result(self, provider_job_id: str) -> bytes:
         model_id, cfg = self._lookup(provider_job_id)
+        self._check_deadline(provider_job_id)
+        deadline = self._deadlines.get(provider_job_id)
+        modality = self._modality.get(provider_job_id) or self._modality_of(model_id)
         status, body = self._get_status(provider_job_id, model_id, cfg)
         if status.state != "succeeded":
             raise StudioError(
                 ErrorCode.PROVIDER_ERROR,
-                f"fetch_result called for provider job {provider_job_id} in state "
+                f"fetch_result called for provider job {self._ref(provider_job_id)} in state "
                 f"{status.state!r}; poll until it reports succeeded first.",
             )
         res = cfg.get("result") or {}
@@ -829,13 +1858,16 @@ class HttpPollingAdapter(ProviderAdapter):
             result_url = str(_render(str(res["url"]), ctx, model_id=model_id))
             result_headers = _resolve_env(res.get("headers") or {}, model_id=model_id)
             result_method = str(res.get("method", "GET")).upper()
-            what = f"Result fetch for provider job {provider_job_id}"
+            what = f"Result fetch for provider job {self._ref(provider_job_id)}"
             resp = self._call(
                 result_method,
                 result_url,
                 headers=result_headers,
-                timeout=float(cfg.get("download_timeout_sec", 120.0)),
+                timeout=float(cfg.get("download_timeout_sec", defaults.HTTP_DOWNLOAD_TIMEOUT_SEC)),
                 what=what,
+                deadline=deadline,
+                job=provider_job_id,
+                max_bytes=self._json_cap(cfg, modality, carries_result=True),
             )
             self._raise_for_status(resp, what=what)
             payload_body = self._as_json(resp, what=what)
@@ -848,10 +1880,20 @@ class HttpPollingAdapter(ProviderAdapter):
             if dug is None or dug is _MISSING or str(dug) == "":
                 raise StudioError(
                     ErrorCode.PROVIDER_ERROR,
-                    f"Provider job {provider_job_id} succeeded but has no output "
+                    f"Provider job {self._ref(provider_job_id)} succeeded but has no output "
                     f"bytes at '{bytes_path}'.",
                 )
-            return _decode_inline_bytes(str(dug))
+            what = f"Inline output of provider job {self._ref(provider_job_id)}"
+            if not isinstance(dug, str):
+                raise StudioError(
+                    ErrorCode.PROVIDER_ERROR,
+                    f"{what}: expected a base64 string at '{bytes_path}'.",
+                )
+            data = _decode_inline_bytes(
+                dug, max_bytes=media_check.max_bytes(modality), what=what
+            )
+            media_check.check_media(data, modality, what=what)
+            return data
 
         url_path = res.get("output_url_path")
         if not url_path:
@@ -869,32 +1911,76 @@ class HttpPollingAdapter(ProviderAdapter):
         if not urls:
             raise StudioError(
                 ErrorCode.PROVIDER_ERROR,
-                f"Provider job {provider_job_id} succeeded but has no output "
+                f"Provider job {self._ref(provider_job_id)} succeeded but has no output "
                 f"URLs at '{url_path}'.",
             )
-        what = f"Output download for provider job {provider_job_id}"
-        resp = self._call(
-            "GET",
+        return self._download(
             urls[0],
-            headers=None,
-            timeout=float(cfg.get("download_timeout_sec", 120.0)),
-            what=what,
+            timeout=float(cfg.get("download_timeout_sec", defaults.HTTP_DOWNLOAD_TIMEOUT_SEC)),
+            what=f"Output download for provider job {self._ref(provider_job_id)}",
+            modality=modality,
+            deadline=deadline,
+            job=provider_job_id,
         )
-        self._raise_for_status(resp, what=what)
-        return resp.content
+
+
+def _abandon(adapter: ProviderAdapter, provider_job_id: str) -> None:
+    """Best-effort provider cancel when the local job gives up on it."""
+    try:
+        adapter.cancel(provider_job_id)
+    except Exception:  # noqa: BLE001 - best effort by contract
+        log.warning("provider cancel failed provider_job_id=%s", provider_job_id)
 
 
 def poll_until_done(
     adapter: ProviderAdapter, provider_job_id: str, on_progress=None
 ) -> JobStatus:
-    """Shared polling loop with exponential backoff (2s -> 10s max)."""
+    """Shared polling loop with exponential backoff (2s -> 10s max).
+
+    Bounded by a monotonic total deadline (ADR-0014): the adapter's own job
+    deadline when it tracks one (http_polling starts it at submit, or at
+    restore for a persisted handle — B9 M2), else
+    ``HTTP_JOB_TOTAL_DEADLINE_SEC`` from now. Sleeps never overshoot it. On
+    the deadline, a poll error or the iteration cap the provider job is
+    canceled best-effort and a StudioError is raised (after submit the
+    caller records PROVIDER_UNCERTAIN, plan D7 — never an automatic
+    resubmit).
+    """
+    getter = getattr(adapter, "deadline_for", None)
+    deadline = getter(provider_job_id) if callable(getter) else None
+    gate = getattr(adapter, "sanitize_message", None)
+
+    ref = getattr(adapter, "_ref", None)
+
+    def _expired() -> StudioError:
+        # Redact before capping (B7R3-M1); adapters without _ref quote no id.
+        err = _deadline_error(ref(provider_job_id) if callable(ref) else "")
+        if callable(gate):
+            err.message = gate(err.message)
+            err.args = (err.message,)
+        return err
+
+    if deadline is None:
+        deadline = _monotonic() + defaults.HTTP_JOB_TOTAL_DEADLINE_SEC
     interval = defaults.POLL_INTERVAL_START_SEC
     for _ in range(defaults.POLL_MAX_ITERATIONS):
-        status = adapter.poll(provider_job_id)
+        if _monotonic() >= deadline:
+            _abandon(adapter, provider_job_id)
+            raise _expired()
+        try:
+            status = adapter.poll(provider_job_id)
+        except Exception:
+            _abandon(adapter, provider_job_id)
+            raise
         if on_progress is not None:
             on_progress(status)
         if status.state in ("succeeded", "failed"):
             return status
-        time.sleep(interval)
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            _abandon(adapter, provider_job_id)
+            raise _expired()
+        _sleep(min(interval, remaining))
         interval = min(interval * 2, defaults.POLL_INTERVAL_MAX_SEC)
+    _abandon(adapter, provider_job_id)
     raise StudioError(ErrorCode.PROVIDER_ERROR, "Polling timed out waiting for provider.")

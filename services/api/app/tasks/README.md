@@ -14,6 +14,7 @@
 | `tasks_video.py` | `q.video` (2) | I2V/T2V (Phase 3) |
 | `tasks_audio.py` | `q.audio` (2) | TTS (Phase 4) |
 | `tasks_post.py` | `q.post` (2) | ffmpeg·썸네일·QC·렌더 (Phase 3/4) |
+| `tasks_p1.py` | `q.post` 공용 (태스크명 `q.p1.*`) | 멀티샷·LoRA 학습·스타일 추출 (Phase 5) |
 
 ## 공개 인터페이스
 
@@ -34,5 +35,9 @@
 
 ## 함정
 
-- `bind=True` + `max_retries`는 재시도 정책(§12)의 Celery 표현이다.
+- `bind=True` + `max_retries`는 재시도 정책(§12)의 Celery 표현이다. 단, 자동 재시도는 provider에 확실히 전송되지 않은
+  실패만이다. submit 이후 결과가 불확실하면 `failed`+`PROVIDER_UNCERTAIN`이고 자동 재제출하지 않는다(ADR-0013 D7).
+- 태스크는 시작 시 행을 claim(`queued → running`, `exec_token` + lease)한다. 0행(중복 전달·terminal 행)이면 no-op으로 ACK한다.
+  이후 쓰기는 `id + exec_token + status` 조건부이고, 산출물은 토큰 앞 8자를 붙인 시도별 파일로 쓴다
+  (`services/job_execution.py`, ADR-0013). 잃은 잡은 API lifespan의 reconcile 루프가 복구한다(`services/job_recovery.py`).
 - Phase 0에서 generation 행이 잡 행을 겸한다. SSE의 `job_id` = `generation_id`.
